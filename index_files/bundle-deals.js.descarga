@@ -1,0 +1,2529 @@
+/**
+ * SMART Discounts — Storefront Widget Engine
+ *
+ * This script powers the bundle/volume-discount widget on Shopify storefronts.
+ * It runs from the <head> on every page, but only activates on product pages
+ * where it can find (or auto-create) a <bundle-deals-widget> placeholder.
+ *
+ * Architecture overview:
+ *   1. DEAL_CATALOG        – Mock deal data (replace with metafield reads later)
+ *   2. THEME_SELECTORS     – CSS selector registry for cross-theme compatibility
+ *   3. Utilities            – DOM helpers, money formatting, proximity matching
+ *   4. VariantResolver     – Maps option selections → Shopify variant IDs
+ *   5. ThemeBridge         – Discovers & connects to native theme elements
+ *   6. CartProxy           – Intercepts add-to-cart at fetch/XHR/form level
+ *   7. WidgetUI            – Builds the tier picker + per-item variant selectors
+ *   8. DealEngine          – Orchestrates everything for one product/deal pair
+ *   9. Bootstrap           – Entry point, runs on DOMContentLoaded
+ *
+ * Line-item properties are used: the widget sets a _deal_block attribute on
+ * each cart item to identify which bundle block it belongs to. The Shopify
+ * Discount Function reads this attribute to group lines and apply the
+ * correct discount. Sub-block items (gifts, upsells, etc.) use
+ * blockId + "_" + subBlockId (e.g. "aB3xZ_kL9mN").
+ */
+(function () {
+  "use strict";
+
+  /* =================================================================
+   * SECTION 1 — DEAL CATALOG
+   *
+   * Loaded from app metafields via a <script type="application/json">
+   * block rendered by the Liquid embed. The embed parses the offers
+   * dict (keyed by discount ID) into the array format expected here.
+   *
+   * ---- Deal types ----
+   *   "quantity_break"      – Buy N items, get X% or $X off (volume discount)
+   *   "bxgy"               – Buy X items, get Y items free / discounted
+   *   "fixed_bundle_price" – Entire bundle for a flat $ amount
+   *   "flat_discount"      – Fixed $ off per tier
+   *
+   * ---- Tier discount types ----
+   *   "none"        – No discount (used for the single-item baseline tier)
+   *   "percentage"  – Percentage off each item
+   *   "fixed_amount"– Flat $ off each item
+   *   "fixed_total" – The entire tier costs exactly this $ value
+   * ================================================================= */
+
+  var DEAL_CATALOG = [];
+  try {
+    var catalogEl = document.getElementById("bundle-deals-catalog");
+    if (catalogEl) DEAL_CATALOG = JSON.parse(catalogEl.textContent) || [];
+  } catch (e) {
+    console.warn("SMART Discounts -  Could not parse deal catalog:", e);
+  }
+
+  // Back-fill defaults on every deal so older bundles that were saved before
+  // new settings/block fields were added still work without errors.
+  // ensureDealDefaults is defined further down, so we run this at bootstrap.
+  var _catalogDefaultsApplied = false;
+  function applyCatalogDefaults() {
+    if (_catalogDefaultsApplied) return;
+    _catalogDefaultsApplied = true;
+    for (var i = 0; i < DEAL_CATALOG.length; i++) {
+      ensureDealDefaults(DEAL_CATALOG[i]);
+    }
+  }
+
+  var GIFT_PRODUCTS = {};
+
+  /* =================================================================
+   * SECTION 2 — THEME COMPATIBILITY: CSS SELECTOR REGISTRY
+   *
+   * Every Shopify theme structures its product page differently.
+   * These selector lists let us find the key elements on any theme.
+   * They are tried in order — first match wins.
+   *
+   * When adding support for a new theme, add its selectors near the
+   * top of the relevant array so it matches before generic fallbacks.
+   * ================================================================= */
+
+  // Selectors for the <form action="/cart/add"> element
+  var CART_FORM_SELECTORS = [
+    'form[action*="/cart/add"]',
+    'form[data-type="add-to-cart-form"]',
+    'form.shopify-product-form',
+    "form.product-form",
+    "form.product_form",
+  ];
+
+  // Selectors for the submit / add-to-cart button INSIDE the form
+  var SUBMIT_BUTTON_SELECTORS = [
+    'button[name="add"]',
+    "button.product-form__submit",
+    "button.ProductForm__AddToCart",
+    "button.add-to-cart-button",
+    "button.btn-addtocart",
+    "button.product__submit__add",
+    "button.single_add_to_cart_button",
+    "button.product-add-to-cart",
+    "x-buy-button",
+    'button[type="submit"]',
+    'input[type="submit"]',
+  ];
+
+  // Selectors for the container AROUND the buy/add-to-cart buttons.
+  // Used to determine WHERE to insert the widget on the page.
+  // Each entry is [buyButtonContainer, quantityContainer (nullable)].
+  var PLACEMENT_PAIRS = [
+    // Dawn / Horizon / free Shopify themes (2024+)
+    [".buy-buttons-block", ".quantity-selector-wrapper"],
+    ["product-form", ".product-form__quantity"],
+    // Impact
+    [".product-info__buy-buttons", ".product-info__quantity-selector"],
+    // Prestige
+    [".ProductForm__BuyButtons, .ProductForm__AddToCart", ".ProductForm__QuantitySelector"],
+    ['[data-block-type="buy-buttons"]', '[data-block-type="quantity-selector"]'],
+    // Warehouse
+    [".product-form__payment-container", ".product-form__info-item--quantity"],
+    // Empire
+    [".product-form--atc", ".product-form--atc-qty"],
+    // Turbo
+    [".purchase-details", ".purchase-details__quantity"],
+    // Expanse
+    [".product-single__form .payment-buttons", ".product__quantity"],
+    // Debut (classic)
+    [".product-form__item--submit", '.product-form__item--quantity, label[for="Quantity-product-template"]'],
+    // Debutify
+    [".product-single__add-to-cart", ".product-single__quantity"],
+    // Brooklyn / Minimal
+    [".product-single__add-to-cart", ".product-single__quantity"],
+    // Venture
+    [".product-form__item--submit", ".product-form__item--quantity"],
+    // Symmetry
+    [".buy-buttons-row", ".quantity-wrapper"],
+    // Palo Alto
+    [".product__submit__buttons", null],
+    // Motion
+    [".product-form-block", ".product-form__quantity"],
+    // Showcase
+    [".product-detail__form__action", null],
+    // Kalles / Unsen
+    [".t4s-product-form__buttons", "[data-quantity-wrapper]"],
+    // Alchemy
+    [".qty-wrapper--with-payment-button", ".product-qty"],
+    // Ella
+    [".product-form__buttons", ".quantity_selector"],
+    // Booster
+    [".product__atc", ".quantity--input"],
+    // Focal
+    [".product-form__payment-container", ".quantity-selector"],
+    // EComposer
+    [".ecom-product-single__add-to-cart", ".ecom-product-single__quantity"],
+    // Solodrop
+    [".product-form__submit", ".product__quantity"],
+    // Enterprise
+    [".product-info__add-to-cart", "quantity-input"],
+    // Blockshop
+    [".product-form--button-container", null],
+    // Baseline
+    [".shopify-product-form", ".product-quantity-block"],
+    // Avenue
+    [".purchase-section", ".quantity.form"],
+    // Colors
+    [".type_buy_buttons", ".type_quantity_selector"],
+    // GemPages
+    ["gp-product-button", "gp-product-quantity"],
+    // PageFly
+    ['[data-pf-type^="ProductATC"]', '[data-pf-type="ProductQuantity"]'],
+  ];
+
+  // Selectors for native variant pickers (radio groups, select dropdowns, custom elements)
+  var VARIANT_PICKER_SELECTORS = [
+    "variant-picker",
+    "variant-selects",
+    "variant-radios",
+    "product-variants",
+    "gp-product-variants",
+    ".gf_variants-wrapper",
+    ".product-selectors",
+    ".product-block-variant-picker",
+    "dm-variant-selects",
+    "simple-variant-picker",
+    ".variant-wrapper",
+    ".radio-wrapper",
+    "div[data-product-option]",
+  ];
+
+  // Selectors for price display elements (used if we want to update visible price)
+  var PRICE_DISPLAY_SELECTORS = [
+    "product-price .price",
+    ".product__price .price",
+    ".product__price",
+    ".product-single__price",
+    ".price__regular .price-item--regular",
+    ".ProductMeta__Price",
+    '[data-product-type="price"]',
+    ".current-price",
+  ];
+
+  /* =================================================================
+   * SECTION 3 — UTILITY HELPERS
+   * ================================================================= */
+
+  /** Safe querySelector — returns null instead of throwing on bad selectors */
+  function qs(selector, root) {
+    try { return (root || document).querySelector(selector); }
+    catch (_) { return null; }
+  }
+
+  /** Safe querySelectorAll — returns [] instead of throwing */
+  function qsa(selector, root) {
+    try { return Array.from((root || document).querySelectorAll(selector)); }
+    catch (_) { return []; }
+  }
+
+  /** Create an element with optional class and attributes */
+  function el(tag, className, attrs) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (attrs) Object.keys(attrs).forEach(function (k) { node.setAttribute(k, attrs[k]); });
+    return node;
+  }
+
+  /** Measure widest option text and set max-width on a <select> */
+  var _measureCtx;
+  function capSelectWidth(select) {
+    if (!_measureCtx) _measureCtx = document.createElement("canvas").getContext("2d");
+    var family = window.getComputedStyle(document.body).fontFamily || "sans-serif";
+    _measureCtx.font = "13px " + family;
+    var maxW = 0;
+    for (var i = 0; i < select.options.length; i++) {
+      var w = _measureCtx.measureText(select.options[i].textContent).width;
+      if (w > maxW) maxW = w;
+    }
+    var capped = Math.min(Math.ceil(maxW + 52), 150);
+    select.style.maxWidth = capped + "px";
+  }
+
+  /**
+   * Proximity matcher: given an anchor element and an array of candidate
+   * elements, return the candidate with the shortest path through the DOM
+   * tree to the anchor.  "Distance" = number of parentNode hops from
+   * candidate to the lowest common ancestor, plus hops from anchor to
+   * that same ancestor.
+   */
+  function findNearest(anchor, candidates) {
+    if (!candidates.length) return null;
+    if (candidates.length === 1) return candidates[0];
+
+    var best = null;
+    var bestDist = Infinity;
+
+    candidates.forEach(function (cand) {
+      var dist = domDistance(anchor, cand);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = cand;
+      }
+    });
+    return best;
+  }
+
+  /** Compute a rough DOM distance between two elements */
+  function domDistance(a, b) {
+    var ancestorsA = ancestorChain(a);
+    var ancestorsB = ancestorChain(b);
+    for (var i = 0; i < ancestorsA.length; i++) {
+      var idx = ancestorsB.indexOf(ancestorsA[i]);
+      if (idx !== -1) return i + idx;
+    }
+    return Infinity;
+  }
+
+  function ancestorChain(node) {
+    var chain = [];
+    while (node) { chain.push(node); node = node.parentElement; }
+    return chain;
+  }
+
+  /**
+   * Watch an element for removal from the DOM.
+   * Calls `callback` once when the element is detached, then disconnects.
+   */
+  function onRemoved(element, callback) {
+    if (!element || !element.parentNode) return;
+    var obs = new MutationObserver(function (mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        for (var j = 0; j < mutations[i].removedNodes.length; j++) {
+          if (mutations[i].removedNodes[j] === element || mutations[i].removedNodes[j].contains(element)) {
+            obs.disconnect();
+            callback();
+            return;
+          }
+        }
+      }
+    });
+    obs.observe(element.parentNode, { childList: true, subtree: true });
+  }
+
+  /**
+   * Intercept property setter on an element.
+   * Used to detect when themes programmatically set input.value instead of
+   * dispatching a change event.
+   */
+  function watchProperty(element, prop, onChange) {
+    var proto = Object.getPrototypeOf(element);
+    var descriptor = Object.getOwnPropertyDescriptor(proto, prop);
+    if (!descriptor || !descriptor.configurable) return;
+    Object.defineProperty(element, prop, {
+      configurable: true,
+      get: function () { return descriptor.get.call(this); },
+      set: function (val) {
+        var prev = this[prop];
+        descriptor.set.call(this, val);
+        if (prev !== val) onChange(prev, val);
+      },
+    });
+  }
+
+  /* =================================================================
+   * SECTION 4 — MONEY FORMATTING
+   *
+   * Shopify stores prices as integers in the smallest currency unit
+   * (e.g. cents for USD: $24.99 = 2499).  The shop's `money_format`
+   * string (e.g. "${{amount}}") tells us how to display it.
+   * ================================================================= */
+
+  var _globalConfig = null;
+  var _exchangeRate = 1;
+
+  function readGlobalConfig() {
+    var tag = qs("#bundle-deals-global-config");
+    if (tag) {
+      try { _globalConfig = JSON.parse(tag.textContent); } catch (err) {
+        console.error("SMART Discounts -  Failed to parse global config JSON", err);
+      }
+    } else {
+      console.warn("SMART Discounts -  No #bundle-deals-global-config element found — using defaults");
+    }
+    if (!_globalConfig) {
+      _globalConfig = {
+        moneyFormat: "${{amount}}",
+        currency: "USD",
+        shopCurrency: "USD",
+        routes: { root: "/", cartAdd: "/cart/add", cart: "/cart" },
+      };
+    }
+    _detectExchangeRate();
+  }
+
+  function _detectExchangeRate() {
+    if (_globalConfig && _globalConfig.shopCurrency &&
+        _globalConfig.currency === _globalConfig.shopCurrency) {
+      _exchangeRate = 1;
+      return;
+    }
+    if (window.Shopify && Shopify.currency && Shopify.currency.rate) {
+      var r = parseFloat(Shopify.currency.rate);
+      if (!isNaN(r) && r > 0) { _exchangeRate = r; return; }
+    }
+    _exchangeRate = 1;
+  }
+
+  /**
+   * Ensure a price value is in cents (integer).
+   * {{ product | json }} outputs prices as strings like "10.00" (dollars).
+   * Direct Liquid access outputs integers in cents (1000).
+   */
+  function toCents(val) {
+    if (val == null) return 0;
+    if (typeof val === "string") {
+      var num = parseFloat(val);
+      if (isNaN(num)) return 0;
+      return Math.round(num * 100);
+    }
+    if (typeof val === "number") return val;
+    return 0;
+  }
+
+  function amountToCents(val) {
+    return Math.round(parseFloat(val) * 100);
+  }
+
+  // Every money_format token Shopify documents (2026-09-11, tickets c_ff70ffba
+  // and c_ab8548f3: "{{ amount_with_space_separator }}" printed raw, "Ft"
+  // stores lost their space thousands). Mirrors app/lib/money.js.
+  var MONEY_STYLES = {
+    amount: [",", ".", true],
+    amount_no_decimals: [",", ".", false],
+    amount_with_comma_separator: [".", ",", true],
+    amount_no_decimals_with_comma_separator: [".", ",", false],
+    amount_with_apostrophe_separator: ["'", ".", true],
+    amount_with_space_separator: [" ", ",", true],
+    amount_no_decimals_with_space_separator: [" ", ",", false],
+    amount_with_period_and_space_separator: [" ", ".", true]
+  };
+
+  function renderMoney(cents, style) {
+    var negative = cents < 0;
+    var abs = Math.abs(Math.round(cents));
+    var thousands = style[0];
+    var decimal = style[1];
+    var decimals = style[2];
+    var intPart = decimals ? String(Math.floor(abs / 100)) : String(Math.round(abs / 100));
+    var grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, thousands);
+    var body = decimals ? grouped + decimal + String(abs % 100).replace(/^(\d)$/, "0$1") : grouped;
+    return (negative ? "-" : "") + body;
+  }
+
+  function formatMoney(cents) {
+    // Some merchants set Shopify's money_format with an HTML wrapper
+    // (e.g. '<span class="money">${{amount}}</span>') for theme styling.
+    // Strip tags so the widget shows only the amount, since prices are
+    // rendered via textContent which would otherwise show the raw markup.
+    var fmt = ((_globalConfig && _globalConfig.moneyFormat) || "${{amount}}")
+      .replace(/<[^>]*>/g, "")
+      .replace(/&nbsp;/g, "\u00a0")
+      .replace(/&amp;/g, "&");
+    if (fmt.indexOf("{{") === -1) fmt = "{{amount}}";
+    return fmt.replace(/\{\{\s*(amount[a-z_]*)\s*\}\}/g, function (_, token) {
+      return renderMoney(cents, MONEY_STYLES[token] || MONEY_STYLES.amount);
+    });
+  }
+
+  /**
+   * Shopify rounds per-item discount amounts to the currency's decimal
+   * precision BEFORE summing. For zero-decimal currencies (JPY, KRW, …)
+   * this loses fractional units and shifts the final total by ±1.
+   * Detect zero-decimal from the money format string so we can simulate
+   * the same rounding the customer sees at checkout.
+   */
+  function _currencyMinorUnits() {
+    var fmt = (_globalConfig && _globalConfig.moneyFormat) || "";
+    // Internal "cents" per smallest real currency unit.
+    // JPY (0 decimals): 1 yen = 100 internal cents → round unit = 100
+    // USD/PLN (2 decimals): 1 cent = 1 internal cent → round unit = 1
+    return fmt.indexOf("amount_no_decimals") !== -1 ? 100 : 1;
+  }
+
+  /**
+   * Compute the discounted total (in internal cents) for a fixed_total
+   * discount, simulating Shopify's per-item rounding so the widget
+   * matches checkout to the penny/yen.
+   *
+   * Shopify rounds each per-item discount to the currency's smallest
+   * denomination BEFORE summing. For zero-decimal currencies like JPY
+   * this can shift the final total by ±1 vs a naive round-the-total
+   * approach.
+   */
+  function _fixedTotalWithRounding(originalCents, baseValue, itemQty) {
+    var targetCents = amountToCents(baseValue * _exchangeRate);
+    if (itemQty <= 0 || originalCents <= targetCents) return Math.min(originalCents, targetCents);
+
+    var minorUnits = _currencyMinorUnits();
+    if (minorUnits <= 1) return targetCents;
+
+    var totalDiscountCents = originalCents - targetCents;
+    var perItemDisc = totalDiscountCents / itemQty;
+    var roundedPerItem = Math.round(perItemDisc / minorUnits) * minorUnits;
+    return Math.max(0, originalCents - roundedPerItem * itemQty);
+  }
+
+  /**
+   * Discounted unit price for a percentage discount, matching Shopify
+   * checkout exactly: the discount AMOUNT is calculated per unit and
+   * rounded DOWN to the currency's smallest unit. Rounding the discounted
+   * PRICE half-up instead (the old behavior) drifts from checkout by one
+   * cent whenever price × pct doesn't land on a whole cent:
+   *   €29.99 at 10% → checkout floors the discount (€2.99) → €27.00/unit,
+   *   while Math.round(29.99 × 0.9) shows €26.99 and undercharges the widget.
+   *
+   * The percentage is scaled to a 4-decimal integer so price × pct is exact
+   * integer arithmetic — a naive price * value / 100 float can land epsilon
+   * below a whole cent and floor to the wrong value (e.g. 5000 × 12.34%).
+   */
+  function _percentDiscountedPrice(priceCents, percentValue) {
+    var pct = Math.round((parseFloat(percentValue) || 0) * 10000);
+    var minorUnits = _currencyMinorUnits();
+    var flooredDiscount = Math.floor((priceCents * pct) / (1000000 * minorUnits)) * minorUnits;
+    return Math.max(0, priceCents - flooredDiscount);
+  }
+
+  function cartAddUrl() {
+    return (_globalConfig && _globalConfig.routes && _globalConfig.routes.cartAdd) || "/cart/add";
+  }
+
+  function cartUrl() {
+    return (_globalConfig && _globalConfig.routes && _globalConfig.routes.cart) || "/cart";
+  }
+
+  /* =================================================================
+   * SECTION 4b — TRANSLATION RESOLUTION
+   *
+   * Resolves translated text for the storefront widget. Uses the buyer's
+   * locale from _globalConfig.locale to look up translations stored in
+   * deal.translations[locale]. Falls back to the default value if no
+   * translation exists.
+   * ================================================================= */
+
+  /**
+   * Get the buyer's locale from global config (set by Liquid's request.locale.iso_code).
+   * Returns empty string if not available.
+   */
+  function getBuyerLocale() {
+    return (_globalConfig && _globalConfig.locale) || "";
+  }
+
+  /**
+   * Resolve a translated value for a deal. Looks up the buyer's locale in
+   * deal.translations, traversing the dot-separated path. Returns the
+   * translated string if non-empty, otherwise falls back to defaultValue.
+   *
+   * @param {Object} deal - The deal config (contains deal.translations)
+   * @param {string} path - Dot-separated path, e.g. "widgetTitle" or "blocks.abc12.title"
+   * @param {string} defaultValue - Fallback value if no translation found
+   * @returns {string}
+   */
+  function resolveText(deal, path, defaultValue) {
+    var locale = getBuyerLocale();
+    if (!locale || !deal || !deal.translations) return defaultValue;
+    var t = deal.translations[locale];
+    if (!t) return defaultValue;
+    var parts = path.split(".");
+    var current = t;
+    for (var i = 0; i < parts.length; i++) {
+      if (!current || typeof current !== "object") return defaultValue;
+      current = current[parts[i]];
+    }
+    return (current && typeof current === "string" && current.trim() !== "") ? current : defaultValue;
+  }
+
+  /* =================================================================
+   * SECTION 5 — PRODUCT DATA & VARIANT RESOLUTION
+   * ================================================================= */
+
+  /**
+   * Read product JSON that was rendered by the widget.liquid block.
+   * Returns the parsed object, or null if not found.
+   */
+  function readProductJSON(productId) {
+    var script = qs('script[data-bundle-product][data-product-id="' + productId + '"]');
+    if (!script) {
+      console.warn("SMART Discounts -  No <script data-bundle-product> found for product", productId);
+      return null;
+    }
+    try {
+      var raw = JSON.parse(script.textContent);
+      return normalizeProductData(raw);
+    } catch (err) {
+      console.error("SMART Discounts -  Failed to parse product JSON for product", productId, err);
+      return null;
+    }
+  }
+
+  function readProductCollectionIds(productId) {
+    var script = qs('script[data-bundle-product-collections][data-product-id="' + productId + '"]');
+    if (!script) return [];
+    try { return JSON.parse(script.textContent) || []; } catch (e) { return []; }
+  }
+
+  /**
+   * Given a product object and an array of selected option values
+   * (e.g. ["Medium", "Navy"]), return the matching variant object or null.
+   */
+  function resolveVariant(product, selectedOptions) {
+    for (var i = 0; i < product.variants.length; i++) {
+      var v = product.variants[i];
+      var match = true;
+      for (var j = 0; j < selectedOptions.length; j++) {
+        if (v.options[j] !== selectedOptions[j]) { match = false; break; }
+      }
+      if (match) return v;
+    }
+    return null;
+  }
+
+  /** Find a variant by ID */
+  function findVariantById(product, variantId) {
+    for (var i = 0; i < product.variants.length; i++) {
+      if (product.variants[i].id === variantId) return product.variants[i];
+    }
+    return null;
+  }
+
+  /** Determine which option values are available given partial selections */
+  function availableValuesForOption(product, optionIndex, partialSelections) {
+    var available = [];
+    product.variants.forEach(function (v) {
+      if (!v.available) return;
+      var ok = true;
+      for (var i = 0; i < partialSelections.length; i++) {
+        if (i === optionIndex) continue;
+        if (partialSelections[i] && v.options[i] !== partialSelections[i]) { ok = false; break; }
+      }
+      if (ok && available.indexOf(v.options[optionIndex]) === -1) {
+        available.push(v.options[optionIndex]);
+      }
+    });
+    return available;
+  }
+
+  /* =================================================================
+   * SECTION 6 — THEME BRIDGE
+   *
+   * Discovers and connects to the native theme elements surrounding
+   * our widget: the cart form, add-to-cart button, variant picker,
+   * quantity input, and price display.
+   *
+   * All discovery uses the selector registries from Section 2.
+   * When an element is removed from the DOM (common in themes that
+   * re-render sections via AJAX), the bridge re-discovers it.
+   * ================================================================= */
+
+  function ThemeBridge(widgetEl) {
+    this._widget = widgetEl;
+    this._form = null;
+    this._submitBtn = null;
+    this._quantityWrap = null;
+    this._quantityInput = null;
+    this._variantPicker = null;
+    this._priceEl = null;
+    this._variantIdInput = null;
+  }
+
+  /** Run all discovery. Call once after the widget is in the DOM. */
+  ThemeBridge.prototype.discover = function () {
+    this._discoverForm();
+    this._discoverSubmitButton();
+    this._discoverVariantIdInput();
+    this._discoverQuantityInput();
+    this._discoverVariantPicker();
+    this._discoverPrice();
+  };
+
+  ThemeBridge.prototype.form = function () { return this._form; };
+  ThemeBridge.prototype.submitButton = function () { return this._submitBtn; };
+  ThemeBridge.prototype.quantityInput = function () { return this._quantityInput; };
+  ThemeBridge.prototype.variantIdInput = function () { return this._variantIdInput; };
+
+  /**
+   * Walk up from the widget looking for the cart form.
+   * Tries each CART_FORM_SELECTORS at every ancestor level.
+   */
+  ThemeBridge.prototype._discoverForm = function () {
+    var parent = this._widget.parentElement;
+    while (parent) {
+      for (var i = 0; i < CART_FORM_SELECTORS.length; i++) {
+        var form = qs(CART_FORM_SELECTORS[i], parent);
+        if (form) { this._form = form; this._watchElement("_form", "_discoverForm"); return; }
+      }
+      parent = parent.parentElement;
+    }
+    // Fallback: search the whole page, pick nearest to widget
+    for (var j = 0; j < CART_FORM_SELECTORS.length; j++) {
+      var forms = qsa(CART_FORM_SELECTORS[j]);
+      var filtered = forms.filter(notInsideCartDrawer);
+      if (filtered.length) {
+        this._form = findNearest(this._widget, filtered);
+        if (this._form) { this._watchElement("_form", "_discoverForm"); return; }
+      }
+    }
+  };
+
+  ThemeBridge.prototype._discoverSubmitButton = function () {
+    var scope = this._form || document;
+    for (var i = 0; i < SUBMIT_BUTTON_SELECTORS.length; i++) {
+      var btns = qsa(SUBMIT_BUTTON_SELECTORS[i], scope).filter(notInsideCartDrawer);
+      if (btns.length) {
+        this._submitBtn = findNearest(this._widget, btns);
+        if (this._submitBtn) { this._watchElement("_submitBtn", "_discoverSubmitButton"); return; }
+      }
+    }
+  };
+
+  ThemeBridge.prototype._discoverVariantIdInput = function () {
+    if (this._form) {
+      this._variantIdInput = qs('input[name="id"]', this._form);
+    }
+  };
+
+  ThemeBridge.prototype._discoverQuantityInput = function () {
+    // First try theme-specific containers from PLACEMENT_PAIRS
+    var candidates = [];
+    for (var i = 0; i < PLACEMENT_PAIRS.length; i++) {
+      var qSel = PLACEMENT_PAIRS[i][1];
+      if (!qSel) continue;
+      var found = qsa(qSel).filter(notInsideCartDrawer);
+      candidates = candidates.concat(found);
+    }
+    var wrap = findNearest(this._widget, candidates);
+    if (wrap) {
+      this._quantityWrap = wrap;
+      this._quantityInput = wrap.matches("input") ? wrap : qs("input", wrap);
+    }
+  };
+
+  ThemeBridge.prototype._discoverVariantPicker = function () {
+    var candidates = [];
+    for (var i = 0; i < VARIANT_PICKER_SELECTORS.length; i++) {
+      candidates = candidates.concat(qsa(VARIANT_PICKER_SELECTORS[i]).filter(notInsideCartDrawer));
+    }
+    this._variantPicker = findNearest(this._widget, candidates) || null;
+  };
+
+  ThemeBridge.prototype._discoverPrice = function () {
+    for (var i = 0; i < PRICE_DISPLAY_SELECTORS.length; i++) {
+      var els = qsa(PRICE_DISPLAY_SELECTORS[i]).filter(notInsideCartDrawer);
+      var match = findNearest(this._widget, els);
+      if (match) { this._priceEl = match; return; }
+    }
+  };
+
+  /** Hide the native quantity selector wrapper */
+  ThemeBridge.prototype.hideQuantity = function () {
+    if (this._quantityWrap) this._quantityWrap.style.display = "none";
+  };
+
+  /** Hide the native variant picker */
+  ThemeBridge.prototype.hideVariantPicker = function () {
+    if (this._variantPicker) this._variantPicker.style.display = "none";
+  };
+
+  /** Update the form's hidden variant id input */
+  ThemeBridge.prototype.setVariantId = function (variantId) {
+    if (this._variantIdInput) this._variantIdInput.value = variantId;
+  };
+
+  /** Listen for external changes to the variant id input (theme JS changed it) */
+  ThemeBridge.prototype.onVariantIdChange = function (callback) {
+    if (!this._variantIdInput) return;
+    watchProperty(this._variantIdInput, "value", function (_old, val) {
+      callback(Number(val));
+    });
+  };
+
+  /** Re-discover an element when it's removed from the DOM */
+  ThemeBridge.prototype._watchElement = function (fieldName, discoveryMethod) {
+    var self = this;
+    var element = this[fieldName];
+    if (!element) return;
+    onRemoved(element, function () {
+      self[fieldName] = null;
+      self[discoveryMethod]();
+    });
+  };
+
+  function notInsideCartDrawer(el) {
+    return !el.closest(".cart-drawer, cart-drawer, cart-items, .dbtfy-sticky-addtocart, .mini-cart, .side-cart");
+  }
+
+  /* =================================================================
+   * SECTION 7 — CART PROXY
+   *
+   * Intercepts add-to-cart requests at three levels:
+   *   1. window.fetch        — most modern themes (Dawn, Horizon, etc.)
+   *   2. XMLHttpRequest      — older themes / apps
+   *   3. <form> submit event — fallback for themes that do a raw HTML POST
+   *
+   * When an interceptable request is detected, we check if there is
+   * an active bundle for the product being added.  If so, we replace
+   * the request body with the full set of bundle items.
+   *
+   * The interceptor only modifies requests going to /cart/add that
+   * haven't already been sent by us (we tag ours with a query param
+   * `_bundle_sent=1`).
+   *
+   * ---- DEDUP / YIELD PATTERN ----
+   *
+   * Many themes (Dawn, etc.) fire BOTH a form submit event AND a
+   * JS fetch/XHR call for the same add-to-cart action. Without
+   * coordination, both our form handler and fetch wrapper would
+   * intercept — sending the bundle to /cart/add TWICE.
+   *
+   * To prevent this, the form submit handler (capture phase) does NOT
+   * send its own request immediately. Instead it:
+   *   1. Calls preventDefault() to block the native form POST
+   *   2. Stores the pending request in _pendingFormSubmit
+   *   3. Starts a 150ms timer
+   *
+   * If the theme's JS then calls fetch() or XHR (which our wrapper
+   * intercepts), the wrapper sets _pendingFormSubmit = null, cancelling
+   * the form handler's deferred send. The wrapper handles everything,
+   * and the theme gets the response back so it can update its own UI
+   * (cart drawer, notifications, etc.).
+   *
+   * If NO fetch/XHR fires within 150ms (legacy theme doing a plain
+   * HTML form POST with no JS), the timer fires and the form handler
+   * sends the request + redirects to the cart page. This is the
+   * only path where _listenFormSubmit actually sends a request.
+   *
+   * ---- SECTION RENDERING ----
+   *
+   * Themes like Dawn include `sections` and `sections_url` in their
+   * /cart/add request body. Shopify returns rendered section HTML in
+   * the response, which the theme uses to update the cart drawer
+   * without a page reload (see Shopify "Bundled section rendering").
+   *
+   * _extractExtras() pulls these non-item keys from the original
+   * request body (FormData or JSON) and _buildReplacement() merges
+   * them into the replacement payload. This ensures the theme gets
+   * its section HTML back and can open the cart drawer normally.
+   * ================================================================= */
+
+  // 2026-10-02: the new SMART Discounts bundle widget (smart-widget.js) wins on a product it covers.
+  // After it mounts a bundle there it sends the document event "smart-widget:active" { productId }:
+  // this script then hides its own widget for that product and stops rewriting add to cart requests
+  // for it. A request that carries the new widget's _smart_bundle stamp is never rewritten, whatever
+  // the load order (CartProxy._fromSmartWidget).
+  var _smartProducts = {};
+
+  var CartProxy = {
+    _active: false,
+    _bundles: {},  // keyed by product ID → { getItems, skipCart }
+
+    // Dedup flag: set by _listenFormSubmit, cleared by _wrapFetch/_wrapXHR.
+    // When non-null, the form handler has a deferred send pending.
+    // When the fetch/XHR wrapper handles a request, it nulls this out
+    // so the form handler's setTimeout callback exits early.
+    _pendingFormSubmit: null,
+
+    register: function (productId, getItems, skipCart) {
+      if (_smartProducts[String(productId)]) return;
+      this._bundles[productId] = { getItems: getItems, skipCart: !!skipCart };
+      if (!this._active) this._activate();
+    },
+
+    unregister: function (productId) {
+      delete this._bundles[productId];
+    },
+
+    _activate: function () {
+      if (this._active) return;
+      this._active = true;
+      this._wrapFetch();
+      this._wrapXHR();
+      this._listenFormSubmit();
+    },
+
+    /** Check if a URL is an add-to-cart endpoint we should intercept */
+    _isTargetUrl: function (url) {
+      return url && url.indexOf("cart/add") !== -1 && url.indexOf("_bundle_sent=1") === -1;
+    },
+
+    _isCartCreateGql: function (url) {
+      return url && url.indexOf("graphql.json") !== -1 && url.indexOf("operation_name=cartCreate") !== -1;
+    },
+
+    /** True when the request was built by the new bundle widget (its lines carry _smart_bundle). */
+    _fromSmartWidget: function (body) {
+      if (!body) return false;
+      if (typeof body === "string") return body.indexOf("_smart_bundle") !== -1;
+      if (typeof FormData !== "undefined" && body instanceof FormData) {
+        var found = false;
+        body.forEach(function (value, key) {
+          if (String(key).indexOf("_smart_bundle") !== -1) found = true;
+        });
+        return found;
+      }
+      if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+        return body.toString().indexOf("_smart_bundle") !== -1;
+      }
+      return false;
+    },
+
+    _buildGqlReplacement: function (bodyStr) {
+      if (this._fromSmartWidget(bodyStr)) return null;
+      try {
+        var payload = JSON.parse(bodyStr);
+        var lines = payload && payload.variables && payload.variables.input && payload.variables.input.lines;
+        if (!lines || !lines.length) return null;
+
+        var keys = Object.keys(this._bundles);
+        for (var k = 0; k < keys.length; k++) {
+          var bundle = this._bundles[keys[k]];
+          var bundleItems = bundle.getItems();
+          if (!bundleItems || !bundleItems.length) continue;
+
+          var isMatch = lines.some(function (line) {
+            var gid = line.merchandiseId || "";
+            var numericId = Number(gid.replace(/.*\//, ""));
+            return bundleItems.some(function (bi) { return bi.id === numericId; });
+          });
+
+          if (isMatch) {
+            var newLines = bundleItems.map(function (item) {
+              var attrs = [];
+              if (item.properties) {
+                Object.keys(item.properties).forEach(function (key) {
+                  attrs.push({ key: key, value: String(item.properties[key]) });
+                });
+              }
+              return {
+                merchandiseId: "gid://shopify/ProductVariant/" + item.id,
+                quantity: item.quantity,
+                attributes: attrs
+              };
+            });
+            payload.variables.input.lines = newLines;
+            return JSON.stringify(payload);
+          }
+        }
+      } catch (_) {}
+      return null;
+    },
+
+    /**
+     * Given the original request body, determine if it relates to a registered
+     * bundle product.  If so, build and return a replacement body.
+     * Returns null if no interception is needed.
+     *
+     * The replacement body contains { items: [...bundleItems] } plus any
+     * non-item keys from the original body (sections, sections_url, etc.)
+     * preserved by _extractExtras(). This is critical for themes that rely
+     * on Shopify's bundled section rendering to update the cart drawer.
+     */
+    _buildReplacement: function (body) {
+      if (this._fromSmartWidget(body)) return null;
+      var parsed = this._parseBody(body);
+      if (!parsed || !parsed.length) return null;
+
+      var keys = Object.keys(this._bundles);
+      for (var k = 0; k < keys.length; k++) {
+        var bundle = this._bundles[keys[k]];
+        var bundleItems = bundle.getItems();
+        if (!bundleItems || !bundleItems.length) continue;
+
+        var isMatch = parsed.some(function (orig) {
+          return bundleItems.some(function (bi) { return bi.id === orig.id; });
+        });
+
+        if (isMatch) {
+          // When the bundle resolves to a SINGLE line item and the theme sent a
+          // legacy single-item request (url-encoded form params, not a JSON
+          // `items` array), mirror that format: POST the bare line item object.
+          // Shopify then returns its FLAT single-line-item response — the shape
+          // the theme's add-to-cart handler expects. Wrapping it in `{items:[…]}`
+          // would make Shopify return an `{items:[…]}` envelope, breaking themes
+          // that read the line item off the top level of the response.
+          if (bundleItems.length === 1 && this._isLegacyFormBody(body)) {
+            return { body: JSON.stringify(bundleItems[0]), skipCart: bundle.skipCart };
+          }
+          var payload = { items: bundleItems };
+          // Merge non-item keys (sections, sections_url, etc.) from the
+          // original body so Shopify returns section HTML in the response.
+          var extras = this._extractExtras(body);
+          if (extras) {
+            var eKeys = Object.keys(extras);
+            for (var e = 0; e < eKeys.length; e++) payload[eKeys[e]] = extras[eKeys[e]];
+          }
+          return { body: JSON.stringify(payload), skipCart: bundle.skipCart };
+        }
+      }
+      return null;
+    },
+
+    /** True when the original body is a url-encoded form string (not JSON, not FormData). */
+    _isLegacyFormBody: function (body) {
+      if (typeof body !== "string") return false;
+      try { JSON.parse(body); return false; } catch (_) { return true; }
+    },
+
+    /** Parse a request body (FormData, JSON string, or URL-encoded) into items array */
+    _parseBody: function (body) {
+      if (!body) return null;
+
+      // FormData
+      if (body instanceof FormData) {
+        var id = body.get("id");
+        if (id) return [{ id: Number(id), quantity: Number(body.get("quantity") || 1) }];
+        return null;
+      }
+
+      // String — could be JSON or URL-encoded
+      if (typeof body === "string") {
+        // Try JSON
+        try {
+          var obj = JSON.parse(body);
+          if (obj.items) return obj.items.map(function (i) { return { id: Number(i.id), quantity: Number(i.quantity || 1) }; });
+          if (obj.id) return [{ id: Number(obj.id), quantity: Number(obj.quantity || 1) }];
+        } catch (_) {}
+
+        // Try URL-encoded
+        try {
+          var params = new URLSearchParams(body);
+          var urlId = params.get("id");
+          if (urlId) return [{ id: Number(urlId), quantity: Number(params.get("quantity") || 1) }];
+        } catch (_) {}
+      }
+      return null;
+    },
+
+    /**
+     * Extract non-item keys from the original request body that should be
+     * preserved in the replacement payload.
+     *
+     * For FormData (Dawn, most free themes): pulls `sections` and
+     * `sections_url` which Shopify uses for bundled section rendering.
+     * Without these, the /cart/add response won't include section HTML
+     * and the theme's cart drawer / icon bubble won't update.
+     *
+     * For JSON strings (custom themes, apps): carries over ALL keys
+     * except the item-related ones (id, quantity, items, properties)
+     * to be maximally compatible with unknown request formats.
+     *
+     * Returns null if no extra keys are found (e.g. Horizon, which
+     * sends a minimal JSON body with only id/quantity).
+     */
+    _extractExtras: function (body) {
+      var extras = {};
+      if (body instanceof FormData) {
+        var sections = body.get("sections");
+        var sectionsUrl = body.get("sections_url");
+        if (sections) extras.sections = sections;
+        if (sectionsUrl) extras.sections_url = sectionsUrl;
+      } else if (typeof body === "string") {
+        try {
+          var obj = JSON.parse(body);
+          var skip = { items: 1, id: 1, quantity: 1, properties: 1 };
+          var oKeys = Object.keys(obj);
+          for (var i = 0; i < oKeys.length; i++) {
+            if (!skip[oKeys[i]]) extras[oKeys[i]] = obj[oKeys[i]];
+          }
+        } catch (_) {}
+      }
+      return Object.keys(extras).length > 0 ? extras : null;
+    },
+
+    /** Monkey-patch window.fetch to intercept /cart/add calls. Primary interceptor for modern themes. */
+    _wrapFetch: function () {
+      var realFetch = window.fetch.bind(window);
+      var self = this;
+
+      window.fetch = function (input, init) {
+        var url = typeof input === "string" ? input : (input instanceof URL ? input.href : input.url);
+        if (self._isTargetUrl(url)) {
+          var result = self._buildReplacement(init && init.body);
+          if (result) {
+            // Cancel the form handler's deferred send — we're handling it here.
+            // This is the key dedup mechanism: the fetch wrapper wins over the
+            // form handler, preserving the theme's native response handling.
+            self._pendingFormSubmit = null;
+            // Build headers via Headers so our JSON content type reliably OVERWRITES
+            // any case-variant Content-Type the theme set (Object.assign would let the
+            // theme's value win / duplicate the key), while keeping all other headers.
+            var newHeaders = new Headers((init && init.headers) || {});
+            newHeaders.set("Content-Type", "application/json");
+            var newInit = Object.assign({}, init || {}, {
+              method: "POST",
+              headers: newHeaders,
+              body: result.body,
+            });
+            var separator = url.indexOf("?") === -1 ? "?" : "&";
+            var promise = realFetch(url + separator + "_bundle_sent=1", newInit);
+            if (result.skipCart) {
+              var checkoutPath = ((_globalConfig && _globalConfig.routes && _globalConfig.routes.root) || "/") + "checkout";
+              promise.then(function () { window.location.href = checkoutPath; });
+            }
+            return promise;
+          }
+        }
+        if (self._isCartCreateGql(url)) {
+          var gqlBody = self._buildGqlReplacement(init && init.body);
+          if (gqlBody) {
+            var gqlInit = Object.assign({}, init || {}, { body: gqlBody });
+            return realFetch(input, gqlInit);
+          }
+        }
+        return realFetch(input, init);
+      };
+    },
+
+    /** Monkey-patch XMLHttpRequest to intercept /cart/add calls. Covers older themes that use XHR instead of fetch. */
+    _wrapXHR: function () {
+      var realOpen = XMLHttpRequest.prototype.open;
+      var realSend = XMLHttpRequest.prototype.send;
+      var realSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+      var self = this;
+      var urlMap = new WeakMap();
+      var deferredCT = new WeakMap();
+
+      XMLHttpRequest.prototype.open = function (method, url) {
+        urlMap.set(this, url);
+        return realOpen.apply(this, arguments);
+      };
+
+      // For target /cart/add requests, hold the theme's Content-Type instead of
+      // forwarding it. setRequestHeader APPENDS (it does not overwrite), so letting
+      // the theme's value through corrupts our application/json header (which the
+      // /cart/add.js items array requires). Replayed in send() if we don't intercept.
+      XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        var url = urlMap.get(this);
+        if (url && self._isTargetUrl(url) && String(name).toLowerCase() === "content-type") {
+          var list = deferredCT.get(this) || [];
+          list.push([name, value]);
+          deferredCT.set(this, list);
+          return;
+        }
+        return realSetRequestHeader.apply(this, arguments);
+      };
+
+      XMLHttpRequest.prototype.send = function (body) {
+        var url = urlMap.get(this);
+        if (self._isTargetUrl(url)) {
+          var result = self._buildReplacement(body);
+          if (result) {
+            // Cancel form handler's deferred send (same dedup as _wrapFetch).
+            self._pendingFormSubmit = null;
+            realSetRequestHeader.call(this, "Content-Type", "application/json");
+            if (result.skipCart) {
+              var xhr = this;
+              var checkoutPath = ((_globalConfig && _globalConfig.routes && _globalConfig.routes.root) || "/") + "checkout";
+              xhr.addEventListener("load", function () { window.location.href = checkoutPath; });
+            }
+            return realSend.call(this, result.body);
+          }
+          // Not a bundle request — replay the theme's original Content-Type(s) we
+          // deferred above so normal add-to-cart behaves exactly as before.
+          var deferred = deferredCT.get(this);
+          if (deferred) {
+            for (var i = 0; i < deferred.length; i++) realSetRequestHeader.call(this, deferred[i][0], deferred[i][1]);
+          }
+        }
+        return realSend.apply(this, arguments);
+      };
+    },
+
+    /**
+     * Listen for <form> submit events as a FALLBACK interceptor.
+     *
+     * Registered in capture phase (third arg = true) so it fires BEFORE
+     * any theme-level bubble-phase handlers. This lets us preventDefault()
+     * early to block the native HTML form POST.
+     *
+     * IMPORTANT: This handler does NOT send the request itself immediately.
+     * It uses the yield/defer pattern (see section header comment) to avoid
+     * double-firing on themes like Dawn that both submit the form AND call
+     * fetch() from their own JS handler.
+     *
+     * Flow on modern themes (Dawn, etc.):
+     *   1. This handler fires (capture) → preventDefault(), stores pending, starts 150ms timer
+     *   2. Theme's handler fires (bubble) → calls fetch('/cart/add', { body: formData })
+     *   3. _wrapFetch intercepts → sets _pendingFormSubmit = null → sends one request
+     *   4. Timer fires → _pendingFormSubmit is null → exits early (no second request)
+     *   5. Theme gets response with section HTML → cart drawer opens normally
+     *
+     * Flow on legacy themes (raw HTML POST, no JS):
+     *   1. This handler fires (capture) → preventDefault(), stores pending, starts 150ms timer
+     *   2. No theme JS calls fetch/XHR
+     *   3. Timer fires → _pendingFormSubmit still set → sends request + redirects to cart
+     */
+    _listenFormSubmit: function () {
+      var self = this;
+      document.addEventListener("submit", function (evt) {
+        if (evt.defaultPrevented) return;
+        var form = evt.target;
+        if (!(form instanceof HTMLFormElement)) return;
+        if (!self._isTargetUrl(form.action)) return;
+
+        var fd = new FormData(form);
+        var result = self._buildReplacement(fd);
+        if (result) {
+          evt.preventDefault();
+          // Defer: store the pending request and wait for fetch/XHR to handle it.
+          self._pendingFormSubmit = { url: form.action, result: result, form: form };
+          setTimeout(function () {
+            // If _wrapFetch or _wrapXHR already handled the request, this will
+            // be null and we exit. Only fires for legacy non-JS themes.
+            if (!self._pendingFormSubmit) return;
+            var pending = self._pendingFormSubmit;
+            self._pendingFormSubmit = null;
+            var separator = pending.url.indexOf("?") === -1 ? "?" : "&";
+            var redirectUrl = pending.result.skipCart ? "/checkout" : cartUrl();
+            fetch(pending.url + separator + "_bundle_sent=1", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: pending.result.body,
+            })
+              .then(function () { window.location.href = redirectUrl; })
+              .catch(function () { pending.form.submit(); });
+          }, 150);
+        }
+      }, true);
+    },
+  };
+
+  /* =================================================================
+   * SECTION 8 — WIDGET UI CONSTRUCTION
+   *
+   * Builds the visual widget: tier bars with radio selection, per-item
+   * variant dropdowns, pricing, badges, and labels.
+   *
+   * All DOM is created with plain JS — no framework dependency.
+   * Class names are prefixed with "bd-" to avoid collisions with themes.
+   *
+   * MINIMAL STRUCTURAL CSS is injected once. There's intentionally very
+   * little styling here — just enough for the layout to make sense.
+   * ================================================================= */
+
+  var _cssInjected = false;
+
+  function injectBaseCSS() {
+    if (_cssInjected) return;
+    _cssInjected = true;
+    var style = document.createElement("style");
+    style.id = "bundle-deals-base-css";
+    style.textContent = [
+      ".bd-widget { width:100%; margin:15px 0 10px; text-align:start; line-height:1.4; font-family:inherit; }",
+      ".bd-title { display:flex; align-items:center; gap:8px; margin-bottom:10px; font-weight:bold; font-size:var(--bd-title-fs,14px); color:var(--bd-title-color,inherit); }",
+      ".bd-title::before, .bd-title::after { content:''; flex:1; height:var(--bd-border-w,2px); background:var(--bd-title-divider,rgba(0,0,0,.15)); }",
+      ".bd-title--left::before { display:none; }",
+      ".bd-title--right::after { display:none; }",
+      ".bd-tiers { display:flex; flex-direction:column; gap:var(--bd-tier-gap,8px); }",
+      ".bd-tiers--horizontal { flex-direction:row; align-items:stretch; }",
+      ".bd-tier { position:relative; border:var(--bd-border-w,2px) solid var(--bd-border,rgba(0,0,0,.15)); border-radius:var(--bd-radius,8px); cursor:pointer; background:var(--bd-tier-bg,#fff); transition: border-color .15s, background .15s; }",
+      ".bd-tier:not(.bd-tier--active):not(.bd-tier--sold-out):hover { border-color:var(--bd-border-hover,rgba(0,0,0,.35)); }",
+      ".bd-tier--active { border-color:var(--bd-border-active,#333); background:var(--bd-tier-bg-active,#fafafa); }",
+      ".bd-tier__radio { display:none; }",
+      ".bd-tier__body { padding:var(--bd-tier-pad,12px 16px); }",
+      ".bd-tier__main { display:flex; align-items:center; gap:14px; }",
+      ".bd-tier__dot { width:20px; height:20px; border-radius:50%; border:2px solid var(--bd-dot,rgba(0,0,0,.25)); background:var(--bd-tier-bg,#fff); flex-shrink:0; box-sizing:border-box; transition: all .15s; display:flex; align-items:center; justify-content:center; }",
+      ".bd-tier__dot::after { content:''; width:10px; height:10px; border-radius:50%; background:transparent; transition: background .15s; }",
+      ".bd-tier--active .bd-tier__dot { border-color:var(--bd-dot-active,#333); }",
+      ".bd-tier--active .bd-tier__dot::after { background:var(--bd-dot-active,#333); }",
+      ".bd-tier__info { flex:1; display:flex; flex-direction:column; gap:2px; }",
+      ".bd-tier__name-row { display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; }",
+      ".bd-tier__name { font-weight:var(--bd-name-fw,600); font-size:var(--bd-name-fs,16px); color:var(--bd-name-color,inherit); }",
+      ".bd-tier__sub { font-size:var(--bd-sub-fs,13px); color:var(--bd-sub-color,#666); }",
+      ".bd-tier__prices { text-align:right; flex-shrink:0; }",
+      ".bd-tier__price { font-weight:var(--bd-price-fw,600); font-size:var(--bd-price-fs,16px); color:var(--bd-price-color,inherit); }",
+      ".bd-tier__compare { text-decoration:line-through; color:var(--bd-compare-color,#888); font-size:var(--bd-sub-fs,13px); }",
+      ".bd-tier__label { display:inline-block; padding:2px 8px; border-radius:6px; background:var(--bd-label-bg,rgba(0,0,0,.07)); color:var(--bd-label-color,inherit); font-size:11px; font-weight:600; }",
+      ".bd-tier__badge { position:absolute; top:-10px; right:12px; padding:3px 10px; border-radius:var(--bd-badge-radius,6px); font-size:11px; font-weight:700; background:var(--bd-badge-bg,#333); color:var(--bd-badge-color,#fff); z-index:1; }",
+      ".bd-variants { margin-top:15px; display:flex; flex-direction:column; gap:8px; }",
+      ".bd-variant-row { display:flex; align-items:center; gap:8px; }",
+      ".bd-variant-row__left { display:flex; align-items:center; gap:6px; flex-shrink:0; }",
+      ".bd-variant-row__img { width:36px; height:36px; object-fit:contain; border-radius:4px; border:1px solid #eee; flex-shrink:0; }",
+      ".bd-variant-row__selects { display:flex; gap:6px; flex-wrap:wrap; flex:1; min-width:0; }",
+      ".bd-variant-select { font-size:13px; padding:6px 24px 6px 8px; border:1px solid var(--bd-border,rgba(0,0,0,.2)); border-radius:4px; background:var(--bd-tier-bg,#fff); color:var(--bd-name-color,inherit); appearance:auto; cursor:pointer; min-width:75px; flex:1; max-width:500px; box-sizing:border-box; }",
+      "@media (max-width:450px) { .bd-variant-select { max-width:unset; min-width:100px; } }",
+      ".bd-variant-row__num { font-size:12px; min-width:18px; color:var(--bd-sub-color,#555); }",
+      ".bd-tier--sold-out { pointer-events:none; cursor:default; position:relative; }",
+      ".bd-tier--sold-out .bd-tier__body { opacity:.4; }",
+      ".bd-tier--sold-out .bd-tier__badge { display:none; }",
+      ".bd-tier__sold-out-overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:2; }",
+      ".bd-tier__sold-out-overlay span { background:var(--bd-soldout-bg,rgba(0,0,0,.75)); color:var(--bd-soldout-color,#fff); font-size:12px; font-weight:700; text-transform:uppercase; padding:6px 18px; border-radius:6px; letter-spacing:.5px; box-shadow:0 2px 8px rgba(0,0,0,.15); }",
+
+      // Horizontal layout overrides — stack content vertically within each card
+      ".bd-tiers--horizontal .bd-tier { flex:1; min-width:0; }",
+      ".bd-tiers--horizontal .bd-tier__body { display:flex; flex-direction:column; align-items:center; text-align:center; padding:var(--bd-tier-pad,18px 10px 14px); }",
+      ".bd-tiers--horizontal .bd-tier__main { flex-direction:column; gap:6px; width:100%; }",
+      ".bd-tiers--horizontal .bd-tier__dot { width:18px; height:18px; }",
+      ".bd-tiers--horizontal .bd-tier__info { text-align:center; }",
+      ".bd-tiers--horizontal .bd-tier__name { font-size:var(--bd-name-fs,15px); }",
+      ".bd-tiers--horizontal .bd-tier__name-row { justify-content:center; }",
+      ".bd-tiers--horizontal .bd-tier__prices { text-align:center; margin-top:4px; }",
+      ".bd-tiers--horizontal .bd-tier__price { font-size:var(--bd-price-fs,18px); }",
+      ".bd-tiers--horizontal .bd-variants { align-items:center; }",
+      ".bd-tiers--horizontal .bd-variant-row { flex-direction:column; align-items:center; }",
+      ".bd-tiers--horizontal .bd-variant-row__selects { flex-direction:column; align-items:center; }",
+      ".bd-tiers--horizontal .bd-variant-select { max-width:calc(100% - 4px); width:calc(100% - 4px); box-sizing:border-box; }",
+      ".bd-tiers--horizontal .bd-tier__badge { right:auto; left:50%; transform:translate(-50%,-50%); top:0; white-space:nowrap; font-size:10px; padding:2px 8px; }",
+      ".bd-tiers--horizontal .bd-free-gift { text-align:center; }",
+      ".bd-tiers--horizontal .bd-free-gift__row { flex-direction:column; align-items:center; justify-content:center; }",
+      ".bd-tiers--horizontal .bd-free-gift__title { white-space:normal; }",
+      ".bd-tiers--horizontal .bd-free-gift__selectors { justify-content:center; }",
+      ".bd-tiers--horizontal .bd-free-gift__price { margin-left:0; }",
+
+      // Free gift styles — full width inside parent tier card
+      ".bd-free-gifts { display:flex; flex-direction:column; }",
+      ".bd-free-gift { padding:var(--bd-gift-pad-v,10px) var(--bd-gift-pad-h,16px); background:var(--bd-gift-bg,#e8e8e8); border-top:1px solid var(--bd-gift-border,#e8e8e8); }",
+      ".bd-free-gift:last-child { border-radius:0 0 calc(var(--bd-radius,8px) - var(--bd-border-w,2px)) calc(var(--bd-radius,8px) - var(--bd-border-w,2px)); }",
+      ".bd-free-gift__row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }",
+      ".bd-free-gift__title { font-size:var(--bd-gift-title-fs,14px); font-weight:var(--bd-gift-title-fw,600); color:var(--bd-gift-text,#000); white-space:nowrap; flex-shrink:0; }",
+      ".bd-free-gift__img { width:var(--bd-gift-img-size,36px); height:var(--bd-gift-img-size,36px); object-fit:contain; border-radius:var(--bd-gift-img-radius,8px); border:var(--bd-gift-img-bw,1px) solid var(--bd-gift-img-bc,#fff); background:var(--bd-gift-img-bc,#fff); flex-shrink:0; }",
+      ".bd-free-gift__selectors { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }",
+      ".bd-free-gift__select { font-size:var(--bd-gift-sel-fs,12px); padding:4px 20px 4px 6px; border:1px solid var(--bd-gift-sel-border,#ccc); border-radius:var(--bd-gift-sel-radius,4px); background:var(--bd-gift-sel-bg,#fff); color:var(--bd-gift-sel-text,#000); appearance:auto; cursor:pointer; }",
+      ".bd-free-gift__price { flex-shrink:0; font-size:var(--bd-gift-title-fs,13px); margin-left:auto; }",
+      ".bd-free-gift__compare-price { text-decoration:line-through; color:var(--bd-gift-price-color,#888); }",
+      ".bd-tier:not(.bd-tier--active) .bd-free-gift { background:var(--bd-gift-inactive-bg,#f5f5f5); border-color:var(--bd-gift-inactive-border,#f5f5f5); }",
+      ".bd-tier:not(.bd-tier--active) .bd-free-gift__title { color:var(--bd-gift-inactive-text,#666); }",
+      ".bd-tier:not(.bd-tier--active) .bd-free-gift__compare-price { color:var(--bd-gift-inactive-price,#aaa); }",
+      ".bd-tier:not(.bd-tier--active) .bd-free-gift__product-name { color:var(--bd-gift-inactive-text,#666); }",
+    ].join("\n");
+    document.head.appendChild(style);
+  }
+
+  /**
+   * Build the full widget DOM tree for a deal + product.
+   * Returns the root element to be appended into the <bundle-deals-widget>.
+   *
+   * `onTierChange(tierIndex)` is called when the user selects a different tier.
+   * `onVariantChange(tierIndex, slotIndex, optionIndex, value)` is called
+   *   when the user changes a variant dropdown.
+   */
+  /* ------------------------------------------------------------------
+   * DEFAULT_SETTINGS — fallback values for every settings key.
+   *
+   * Older bundles that were saved before new settings were added may
+   * be missing those keys entirely. Rather than crashing the widget,
+   * we merge deal.settings on top of these defaults so missing keys
+   * gracefully fall back.
+   *
+   * >>> KEEP IN SYNC with DEFAULT_SETTINGS in app.discounts.bundle.jsx <<<
+   * ------------------------------------------------------------------ */
+  var DEFAULT_SETTINGS = {
+    allowMixedVariants: true,
+    showVariantPickers: true,
+    showComparePrices: true,
+    showPerItemPrice: false,
+    showVariantImages: true,
+    hideNativeQuantity: true,
+    hideNativeVariantPicker: true,
+    skipCart: false,
+    layout: "vertical",
+    widgetTitle: "Bundle & Save",
+    widgetTitleAlignment: "center",
+    soldOutText: "Sold Out",
+    perItemSuffix: "/ each",
+    custom_css: ""
+  };
+
+  /**
+   * Ensure deal.settings is always a populated object. Merges the saved
+   * settings on top of DEFAULT_SETTINGS so any key added after the bundle
+   * was last saved still gets a sensible value.
+   */
+  function ensureDealDefaults(deal) {
+    deal.settings = assign(DEFAULT_SETTINGS, deal.settings || {});
+    if (!deal.blocks) deal.blocks = [];
+    for (var i = 0; i < deal.blocks.length; i++) {
+      var block = deal.blocks[i];
+      if (block.blockType !== "bxgy" && !block.discount) {
+        block.discount = { type: "none", value: 0 };
+      }
+      if (!block.sub_blocks) block.sub_blocks = [];
+    }
+  }
+
+  /** Shallow merge helper (ES3-safe, no Object.assign dependency) */
+  function assign(defaults, overrides) {
+    var result = {};
+    var key;
+    for (key in defaults) {
+      if (defaults.hasOwnProperty(key)) result[key] = defaults[key];
+    }
+    for (key in overrides) {
+      if (overrides.hasOwnProperty(key)) result[key] = overrides[key];
+    }
+    return result;
+  }
+
+  // Maps deal.settings style keys → CSS custom property names
+  var STYLE_TO_VAR = {
+    tierBorderColor:      "--bd-border",
+    tierBorderHoverColor: "--bd-border-hover",
+    tierActiveBorderColor:"--bd-border-active",
+    tierBgColor:          "--bd-tier-bg",
+    tierActiveBgColor:    "--bd-tier-bg-active",
+    dotColor:             "--bd-dot",
+    dotActiveColor:       "--bd-dot-active",
+    titleColor:           "--bd-title-color",
+    titleDividerColor:    "--bd-title-divider",
+    tierNameColor:        "--bd-name-color",
+    subtitleColor:        "--bd-sub-color",
+    priceColor:           "--bd-price-color",
+    comparePriceColor:    "--bd-compare-color",
+    labelBgColor:         "--bd-label-bg",
+    labelTextColor:       "--bd-label-color",
+    badgeBgColor:         "--bd-badge-bg",
+    badgeTextColor:       "--bd-badge-color",
+    soldOutBgColor:       "--bd-soldout-bg",
+    soldOutTextColor:     "--bd-soldout-color",
+    titleFontSize:        "--bd-title-fs",
+    tierNameFontSize:     "--bd-name-fs",
+    tierNameFontWeight:   "--bd-name-fw",
+    subtitleFontSize:     "--bd-sub-fs",
+    priceFontSize:        "--bd-price-fs",
+    priceFontWeight:      "--bd-price-fw",
+    tierBorderRadius:     "--bd-radius",
+    tierBorderWidth:      "--bd-border-w",
+    tierPadding:          "--bd-tier-pad",
+    tierGap:              "--bd-tier-gap",
+    badgeBorderRadius:    "--bd-badge-radius",
+    freeGiftBgColor:      "--bd-gift-bg",
+    freeGiftTextColor:    "--bd-gift-text",
+    freeGiftBorderColor:  "--bd-gift-border",
+    freeGiftImageBorderRadius: "--bd-gift-img-radius",
+    freeGiftImageBorderWidth:  "--bd-gift-img-bw",
+    freeGiftImageBorderColor:  "--bd-gift-img-bc",
+    freeGiftTitleFontSize: "--bd-gift-title-fs",
+    freeGiftTitleFontWeight: "--bd-gift-title-fw",
+    freeGiftPriceColor:   "--bd-gift-price-color",
+    freeGiftSelectBorderColor: "--bd-gift-sel-border",
+    freeGiftSelectBgColor:     "--bd-gift-sel-bg",
+    freeGiftSelectTextColor:   "--bd-gift-sel-text",
+    freeGiftSelectBorderRadius:"--bd-gift-sel-radius",
+    freeGiftSelectFontSize:    "--bd-gift-sel-fs",
+    freeGiftImageSize:         "--bd-gift-img-size",
+    freeGiftPaddingVertical:   "--bd-gift-pad-v",
+    freeGiftPaddingHorizontal: "--bd-gift-pad-h",
+    freeGiftInactiveBgColor:      "--bd-gift-inactive-bg",
+    freeGiftInactiveTextColor:    "--bd-gift-inactive-text",
+    freeGiftInactiveBorderColor:  "--bd-gift-inactive-border",
+    freeGiftInactivePriceColor:   "--bd-gift-inactive-price",
+  };
+
+  /** Apply style settings as CSS custom properties on an element */
+  function applyStyleVars(element, settings) {
+    var keys = Object.keys(STYLE_TO_VAR);
+    for (var i = 0; i < keys.length; i++) {
+      var val = settings[keys[i]];
+      if (val != null) {
+        element.style.setProperty(STYLE_TO_VAR[keys[i]], val);
+      }
+    }
+  }
+
+  function getBlockQuantity(block) {
+    if (block.blockType === "bxgy") {
+      return (block.buy ? block.buy.quantity : 0) + (block.get ? block.get.quantity : 0);
+    }
+    return block.quantity || 0;
+  }
+
+  function blockHasDiscount(block) {
+    if (block.blockType === "bxgy") return true;
+    return block.discount && block.discount.type !== "none";
+  }
+
+  function buildWidgetDOM(deal, product, state, onTierChange, onVariantChange, onGiftVariantChange) {
+    injectBaseCSS();
+
+    var root = el("div", "bd-widget");
+    // Defense-in-depth: ensureDealDefaults should have run already, but
+    // guard against settings being undefined/null just in case.
+    var settings = deal.settings || {};
+
+    applyStyleVars(root, settings);
+
+    if (settings.custom_css) {
+      var customStyle = document.createElement("style");
+      customStyle.textContent = settings.custom_css;
+      root.appendChild(customStyle);
+    }
+
+    // Widget title
+    if (settings.widgetTitle) {
+      var titleClass = "bd-title";
+      if (settings.widgetTitleAlignment === "left") titleClass += " bd-title--left";
+      else if (settings.widgetTitleAlignment === "right") titleClass += " bd-title--right";
+      var title = el("div", titleClass);
+      title.textContent = resolveText(deal, "widgetTitle", settings.widgetTitle);
+      root.appendChild(title);
+    }
+
+    // Tier container
+    var tiersWrap = el("div", "bd-tiers" + (settings.layout === "horizontal" ? " bd-tiers--horizontal" : ""));
+    root.appendChild(tiersWrap);
+
+    deal.blocks.forEach(function (tier, tIdx) {
+      var isSoldOut = !!tier.soldOut;
+      var isActive = !isSoldOut && tIdx === state.selectedTier;
+      var tierClass = "bd-tier" + (isActive ? " bd-tier--active" : "") + (isSoldOut ? " bd-tier--sold-out" : "");
+      var tierEl = el("div", tierClass);
+      tierEl.setAttribute("data-tier-index", tIdx);
+
+      // Badge
+      if (tier.badge && tier.badgeStyle !== "none") {
+        var badgeClass = "bd-tier__badge";
+        var badge = el("span", badgeClass);
+        badge.textContent = resolveText(deal, "blocks." + tier.id + ".badge", tier.badge);
+        tierEl.appendChild(badge);
+      }
+
+      // Hidden radio for accessibility
+      var radio = el("input", "bd-tier__radio");
+      radio.type = "radio";
+      radio.name = "bd-tier-" + deal.id;
+      radio.value = tIdx;
+      radio.checked = isActive;
+      tierEl.appendChild(radio);
+
+      var body = el("div", "bd-tier__body");
+
+      // Main row: dot + info + prices
+      var main = el("div", "bd-tier__main");
+
+      var dot = el("span", "bd-tier__dot");
+      main.appendChild(dot);
+
+      var info = el("div", "bd-tier__info");
+      var nameWrap = el("div", "bd-tier__name-row");
+      var nameRow = el("span", "bd-tier__name");
+      nameRow.textContent = resolveText(deal, "blocks." + tier.id + ".title", tier.title);
+      nameWrap.appendChild(nameRow);
+
+      // Label chip
+      if (tier.label && blockHasDiscount(tier)) {
+        var label = el("span", "bd-tier__label");
+        var labelText = resolveText(deal, "blocks." + tier.id + ".label", tier.label);
+        var savings = computeTierSavings(tier, product, state, tIdx);
+        labelText = labelText.replace("{{saved_total}}", formatMoney(savings.totalSaved));
+        labelText = labelText.replace("{{saved_percent}}", savings.percent + "%");
+        label.textContent = labelText;
+        nameWrap.appendChild(label);
+      }
+      info.appendChild(nameWrap);
+
+      var subText = resolveText(deal, "blocks." + tier.id + ".subtitle", tier.subtitle);
+      if (subText) {
+        var sub = el("div", "bd-tier__sub");
+        sub.textContent = subText;
+        info.appendChild(sub);
+      }
+
+      if (isSoldOut) {
+        var overlay = el("div", "bd-tier__sold-out-overlay");
+        var soldTag = el("span");
+        soldTag.textContent = resolveText(deal, "soldOutText", settings.soldOutText || "Sold Out");
+        overlay.appendChild(soldTag);
+        tierEl.appendChild(overlay);
+      }
+      main.appendChild(info);
+
+      // Prices
+      var prices = el("div", "bd-tier__prices");
+      var tierPricing = computeTierPricing(tier, product, state, tIdx);
+      var blockQty = getBlockQuantity(tier);
+      var usePerItem = settings.showPerItemPrice && blockQty > 1;
+      var displayPrice = usePerItem ? Math.round(tierPricing.discountedTotal / blockQty) : tierPricing.discountedTotal;
+      var displayOriginal = usePerItem ? Math.round(tierPricing.originalTotal / blockQty) : tierPricing.originalTotal;
+      var eachSuffix = usePerItem ? " " + resolveText(deal, "perItemSuffix", settings.perItemSuffix || "/ each") : "";
+
+      var priceEl = el("div", "bd-tier__price");
+      priceEl.textContent = formatMoney(displayPrice) + eachSuffix;
+      prices.appendChild(priceEl);
+
+      if (settings.showComparePrices && tierPricing.originalTotal > tierPricing.discountedTotal) {
+        var compare = el("div", "bd-tier__compare");
+        compare.textContent = formatMoney(displayOriginal) + eachSuffix;
+        prices.appendChild(compare);
+      }
+      main.appendChild(prices);
+      body.appendChild(main);
+
+      // Per-item variant selectors (only shown for the active tier, hidden for single-variant products)
+      if (isActive && settings.showVariantPickers && !product.hasOnlyDefaultVariant && settings.allowMixedVariants && getBlockQuantity(tier) > 0) {
+        var variantsWrap = el("div", "bd-variants");
+        for (var s = 0; s < getBlockQuantity(tier); s++) {
+          var row = buildVariantRow(deal, product, tIdx, s, state, settings, onVariantChange);
+          variantsWrap.appendChild(row);
+        }
+        body.appendChild(variantsWrap);
+      }
+
+      // Single variant selector when mixed variants not allowed
+      if (isActive && settings.showVariantPickers && !product.hasOnlyDefaultVariant && !settings.allowMixedVariants && product.options.length > 0) {
+        var singleWrap = el("div", "bd-variants");
+        var singleRow = buildVariantRow(deal, product, tIdx, 0, state, settings, onVariantChange);
+        singleWrap.appendChild(singleRow);
+        body.appendChild(singleWrap);
+      }
+
+      // Free gift sub-blocks
+      if (tier.sub_blocks && tier.sub_blocks.length > 0) {
+        var giftsWrap = el("div", "bd-free-gifts");
+
+        tier.sub_blocks.forEach(function (sub) {
+          if (sub.type !== "free_gift") return;
+          if (!isActive && sub.showWhenNotSelected === false) return;
+          var giftProduct = sub.productHandle ? GIFT_PRODUCTS[sub.productHandle] : null;
+
+          var giftEl = el("div", "bd-free-gift");
+          var giftRow = el("div", "bd-free-gift__row");
+
+          if (giftProduct) {
+            var giftState = state.giftSelections && state.giftSelections[sub.id];
+            var giftVariant = giftState ? resolveVariant(giftProduct, giftState.options) : (giftProduct.variants[0] || null);
+
+            // Image
+            if (sub.showImage !== false) {
+              var imgSrc = sub.customImage || (giftVariant && giftVariant.image) || giftProduct.featuredImage;
+              if (imgSrc) {
+                var giftImg = el("img", "bd-free-gift__img");
+                giftImg.src = imgSrc;
+                giftImg.alt = giftProduct.title || "";
+                giftImg.setAttribute("data-gift-id", sub.id);
+                giftRow.appendChild(giftImg);
+              }
+            }
+          }
+
+          // Title — always shown, inline in the row
+          var giftTitle = el("span", "bd-free-gift__title");
+          giftTitle.textContent = resolveText(deal, "blocks." + tier.id + ".sub_blocks." + sub.id + ".title", sub.title || "");
+          giftRow.appendChild(giftTitle);
+
+          if (giftProduct) {
+            var allowedIds = sub.selectedVariantIds || [];
+
+            // Count how many distinct variants the customer can actually pick from
+            var pickableVariants = giftProduct.variants.filter(function (v) {
+              if (!v.available) return false;
+              if (allowedIds.length > 0 && allowedIds.indexOf(String(v.id)) === -1) return false;
+              return true;
+            });
+            var showSelectors = isActive && !giftProduct.hasOnlyDefaultVariant && giftProduct.options.length > 0 && pickableVariants.length > 1;
+
+            if (showSelectors) {
+              var giftSelectors = el("div", "bd-free-gift__selectors");
+
+              giftProduct.options.forEach(function (opt, optIdx) {
+                var giftSelect = el("select", "bd-free-gift__select");
+                giftSelect.setAttribute("data-gift-id", sub.id);
+                giftSelect.setAttribute("data-option-index", optIdx);
+
+                var availableVals = [];
+                pickableVariants.forEach(function (v) {
+                  if (availableVals.indexOf(v.options[optIdx]) === -1) availableVals.push(v.options[optIdx]);
+                });
+
+                opt.values.forEach(function (val) {
+                  if (allowedIds.length > 0) {
+                    var anyAllowed = giftProduct.variants.some(function (v) {
+                      return v.options[optIdx] === val && allowedIds.indexOf(String(v.id)) !== -1;
+                    });
+                    if (!anyAllowed) return;
+                  }
+
+                  var option = document.createElement("option");
+                  option.value = val;
+                  option.textContent = val;
+                  if (availableVals.indexOf(val) === -1) option.disabled = true;
+                  var giftState2 = state.giftSelections && state.giftSelections[sub.id];
+                  if (giftState2 && giftState2.options[optIdx] === val) option.selected = true;
+                  giftSelect.appendChild(option);
+                });
+
+                giftSelect.addEventListener("change", function () {
+                  if (onGiftVariantChange) onGiftVariantChange(sub.id, optIdx, this.value);
+                });
+                giftSelectors.appendChild(giftSelect);
+              });
+              giftRow.appendChild(giftSelectors);
+            }
+
+            // Price (crossed out) — pushed to the right via margin-left:auto
+            var giftVariant2 = (state.giftSelections && state.giftSelections[sub.id])
+              ? resolveVariant(giftProduct, state.giftSelections[sub.id].options)
+              : (giftProduct.variants[0] || null);
+            if (sub.showPrice !== false && giftVariant2) {
+              var priceDiv = el("div", "bd-free-gift__price");
+              var comparePrice = el("span", "bd-free-gift__compare-price");
+              comparePrice.textContent = formatMoney(giftVariant2.price);
+              priceDiv.appendChild(comparePrice);
+              giftRow.appendChild(priceDiv);
+            }
+          }
+
+          giftEl.appendChild(giftRow);
+
+          giftsWrap.appendChild(giftEl);
+        });
+
+      }
+
+      tierEl.appendChild(body);
+      if (giftsWrap) tierEl.appendChild(giftsWrap);
+      tiersWrap.appendChild(tierEl);
+
+      // Click handler for tier selection (disabled for sold-out tiers)
+      if (!isSoldOut) {
+        tierEl.addEventListener("click", function () {
+          if (tIdx !== state.selectedTier) onTierChange(tIdx);
+        });
+      }
+    });
+
+    return root;
+  }
+
+  /** Build one variant selector row (image + dropdowns for each option) */
+  function buildVariantRow(deal, product, tierIdx, slotIdx, state, settings, onVariantChange) {
+    var row = el("div", "bd-variant-row");
+    var slotState = getSlotState(state, tierIdx, slotIdx);
+
+    // Group #N label and image together so they stay aligned as a unit
+    var hasNum = deal.blocks[tierIdx] && getBlockQuantity(deal.blocks[tierIdx]) > 1 && settings.allowMixedVariants;
+    var variant = resolveVariant(product, slotState.options);
+    var imgSrc = settings.showVariantImages ? ((variant && variant.image) || product.featuredImage) : null;
+
+    if (hasNum || imgSrc) {
+      var left = el("div", "bd-variant-row__left");
+      if (hasNum) {
+        var num = el("span", "bd-variant-row__num");
+        num.textContent = "#" + (slotIdx + 1);
+        left.appendChild(num);
+      }
+      if (imgSrc) {
+        var img = el("img", "bd-variant-row__img");
+        img.src = imgSrc;
+        img.alt = "";
+        img.setAttribute("data-slot", slotIdx);
+        left.appendChild(img);
+      }
+      row.appendChild(left);
+    }
+
+    // Dropdowns
+    var selects = el("div", "bd-variant-row__selects");
+    product.options.forEach(function (opt, optIdx) {
+      var select = el("select", "bd-variant-select");
+      select.setAttribute("data-option-index", optIdx);
+      select.setAttribute("data-tier", tierIdx);
+      select.setAttribute("data-slot", slotIdx);
+
+      var availableVals = availableValuesForOption(product, optIdx, slotState.options);
+
+      opt.values.forEach(function (val) {
+        var option = document.createElement("option");
+        option.value = val;
+        option.textContent = val;
+        if (availableVals.indexOf(val) === -1) {
+          option.disabled = true;
+          option.textContent = val + "";//" (unavailable)";
+        }
+        if (val === slotState.options[optIdx]) option.selected = true;
+        select.appendChild(option);
+      });
+
+      select.addEventListener("change", function () {
+        onVariantChange(tierIdx, slotIdx, optIdx, this.value);
+      });
+      if (product.options.length === 1) capSelectWidth(select);
+      selects.appendChild(select);
+    });
+    row.appendChild(selects);
+
+    return row;
+  }
+
+  /* =================================================================
+   * SECTION 9 — PRICING CALCULATIONS
+   * ================================================================= */
+
+  /**
+   * Compute the full and discounted price for a tier.
+   * Uses the variant prices from each slot's currently selected variant.
+   */
+  function applyDiscountToPrice(price, discount) {
+    switch (discount.type) {
+      case "percentage": return _percentDiscountedPrice(price, discount.value);
+      case "fixed_amount": return Math.max(0, price - amountToCents(discount.value * _exchangeRate));
+      case "fixed_total": return -1;
+      default: return price;
+    }
+  }
+
+  function computeTierPricing(tier, product, state, tierIdx) {
+    var original = 0;
+    var discounted = 0;
+    var qty = getBlockQuantity(tier);
+
+    if (tier.blockType === "bxgy") {
+      var buyQty = tier.buy ? tier.buy.quantity : 0;
+      var buyDisc = tier.buy ? tier.buy.discount : { type: "none", value: 0 };
+      var getDisc = tier.get ? tier.get.discount : { type: "percentage", value: 100 };
+      var buyOriginal = 0, buyDiscounted = 0;
+      var getOriginal = 0, getDiscounted = 0;
+
+      // Collect all slot prices, sort descending so the most expensive
+      // items are "buy" and the cheapest items are "get"
+      var prices = [];
+      for (var s = 0; s < qty; s++) {
+        var slotState = getSlotState(state, tierIdx, s);
+        var variant = resolveVariant(product, slotState.options);
+        prices.push(variant ? variant.price : (product.variants[0] ? product.variants[0].price : 0));
+      }
+      prices.sort(function (a, b) { return b - a; });
+
+      for (var i = 0; i < prices.length; i++) {
+        var price = prices[i];
+        if (i < buyQty) {
+          buyOriginal += price;
+          var bp = applyDiscountToPrice(price, buyDisc);
+          if (bp !== -1) buyDiscounted += bp;
+        } else {
+          getOriginal += price;
+          var gp = applyDiscountToPrice(price, getDisc);
+          if (gp !== -1) getDiscounted += gp;
+        }
+      }
+
+      var getQty = tier.get ? tier.get.quantity : 0;
+      if (buyDisc.type === "fixed_total") buyDiscounted = _fixedTotalWithRounding(buyOriginal, buyDisc.value, buyQty);
+      if (getDisc.type === "fixed_total") getDiscounted = _fixedTotalWithRounding(getOriginal, getDisc.value, getQty);
+
+      original = buyOriginal + getOriginal;
+      discounted = buyDiscounted + getDiscounted;
+    } else {
+      var disc = tier.discount || { type: "none", value: 0 };
+      for (var s = 0; s < qty; s++) {
+        var slotState = getSlotState(state, tierIdx, s);
+        var variant = resolveVariant(product, slotState.options);
+        var price = variant ? variant.price : (product.variants[0] ? product.variants[0].price : 0);
+        original += price;
+
+        switch (disc.type) {
+          case "percentage":
+            discounted += _percentDiscountedPrice(price, disc.value);
+            break;
+          case "fixed_amount":
+            discounted += Math.max(0, price - amountToCents(disc.value * _exchangeRate));
+            break;
+          case "fixed_total":
+            break;
+          default:
+            discounted += price;
+        }
+      }
+
+      if (disc.type === "fixed_total") {
+        discounted = _fixedTotalWithRounding(original, disc.value, qty);
+      }
+    }
+
+    return { originalTotal: original, discountedTotal: Math.min(original, Math.max(0, discounted)) };
+  }
+
+  function computeTierSavings(tier, product, state, tierIdx) {
+    var pricing = computeTierPricing(tier, product, state, tierIdx);
+    var saved = pricing.originalTotal - pricing.discountedTotal;
+    var percent = pricing.originalTotal > 0 ? Math.round((saved / pricing.originalTotal) * 100) : 0;
+    return { totalSaved: saved, percent: percent };
+  }
+
+  /* =================================================================
+   * SECTION 10 — STATE MANAGEMENT
+   *
+   * Each DealEngine holds a `state` object tracking which tier is
+   * selected and what variant options are chosen for each slot of
+   * each tier.
+   *
+   * State shape:
+   *   {
+   *     selectedTier: 1,
+   *     slots: {
+   *       "0": [ { options: ["Small","Navy"] }, ... ],  // tier 0 slots
+   *       "1": [ { options: ["Small","Navy"] }, { options: ["Small","Navy"] } ],
+   *       "2": [ ... ],
+   *     }
+   *   }
+   * ================================================================= */
+
+  function createInitialState(deal, product) {
+    var defaultOptions = product.variants[0]
+      ? product.variants[0].options.slice()
+      : product.options.map(function (o) { return o.values[0]; });
+
+    // If the product has a pre-selected variant (from URL), use its options
+    var selected = findVariantById(product, product.selectedVariantId);
+    if (selected) defaultOptions = selected.options.slice();
+
+    var slots = {};
+    deal.blocks.forEach(function (tier, tIdx) {
+      slots[tIdx] = [];
+      var qty = getBlockQuantity(tier);
+      for (var s = 0; s < qty; s++) {
+        slots[tIdx].push({ options: defaultOptions.slice() });
+      }
+    });
+
+    var defaultTier = 0;
+    for (var t = 0; t < deal.blocks.length; t++) {
+      if (deal.blocks[t].selectedByDefault && !deal.blocks[t].soldOut) { defaultTier = t; break; }
+    }
+    if (deal.blocks[defaultTier] && deal.blocks[defaultTier].soldOut) {
+      for (var u = 0; u < deal.blocks.length; u++) {
+        if (!deal.blocks[u].soldOut) { defaultTier = u; break; }
+      }
+    }
+
+    // Initialize gift selections — for each sub_block with a gift product,
+    // store the default option selections so the customer can change them
+    var giftSelections = {};
+    deal.blocks.forEach(function (tier) {
+      var subs = tier.sub_blocks || [];
+      subs.forEach(function (sub) {
+        if (sub.type !== "free_gift" || !sub.productHandle) return;
+        var giftProduct = GIFT_PRODUCTS[sub.productHandle];
+        if (!giftProduct) return;
+
+        // Find the first available variant (respecting selectedVariantIds filter)
+        var allowedIds = sub.selectedVariantIds || [];
+        var firstVariant = null;
+        for (var vi = 0; vi < giftProduct.variants.length; vi++) {
+          var gv = giftProduct.variants[vi];
+          if (!gv.available) continue;
+          if (allowedIds.length > 0 && allowedIds.indexOf(String(gv.id)) === -1) continue;
+          firstVariant = gv;
+          break;
+        }
+        if (!firstVariant && giftProduct.variants.length > 0) {
+          firstVariant = giftProduct.variants[0];
+        }
+        giftSelections[sub.id] = {
+          options: firstVariant ? firstVariant.options.slice() : []
+        };
+      });
+    });
+
+    return {
+      selectedTier: defaultTier,
+      slots: slots,
+      giftSelections: giftSelections,
+    };
+  }
+
+  function getSlotState(state, tierIdx, slotIdx) {
+    if (state.slots[tierIdx] && state.slots[tierIdx][slotIdx]) {
+      return state.slots[tierIdx][slotIdx];
+    }
+    return { options: [] };
+  }
+
+  /* =================================================================
+   * SECTION 11 — DEAL ENGINE
+   *
+   * The main orchestrator for one product/deal pair.
+   * Creates a ThemeBridge, sets up CartProxy, renders the widget,
+   * and coordinates all interactions.
+   * ================================================================= */
+
+  function DealEngine(widgetEl, deal, product) {
+    this._widgetEl = widgetEl;
+    this._deal = deal;
+    this._product = product;
+    this._rendering = false;
+    this._state = createInitialState(deal, product);
+    this._bridge = new ThemeBridge(widgetEl);
+    this._bridge.discover();
+
+    this._setupBridge();
+    this._registerCartProxy();
+    this._render();
+    this._syncFromNativeVariantPicker();
+  }
+
+  DealEngine.prototype._setupBridge = function () {
+    var settings = this._deal.settings || {};
+    if (settings.hideNativeQuantity) this._bridge.hideQuantity();
+    if (settings.hideNativeVariantPicker) this._bridge.hideVariantPicker();
+
+    // Listen for external variant changes (user clicks native picker)
+    var self = this;
+    this._bridge.onVariantIdChange(function (newVariantId) {
+      var variant = findVariantById(self._product, newVariantId);
+      if (!variant) return;
+      // Update the first slot of the active tier to match
+      var tierIdx = self._state.selectedTier;
+      if (self._state.slots[tierIdx] && self._state.slots[tierIdx][0]) {
+        self._state.slots[tierIdx][0].options = variant.options.slice();
+        self._render();
+      }
+    });
+  };
+
+  /** Register with CartProxy so add-to-cart requests get intercepted */
+  DealEngine.prototype._registerCartProxy = function () {
+    var self = this;
+    CartProxy.register(this._product.id, function () {
+      return self._getItemsForCart();
+    }, (this._deal.settings || {}).skipCart);
+  };
+
+  /**
+   * Build the items array that should be sent to /cart/add.
+   * Each slot in the active tier becomes one item.
+   */
+  DealEngine.prototype._getItemsForCart = function () {
+    var tier = this._deal.blocks[this._state.selectedTier];
+    if (!tier) return [];
+
+    var items = [];
+    var qty = getBlockQuantity(tier);
+    var allowMixed = (this._deal.settings || {}).allowMixedVariants;
+    var props = tier.id ? { _deal_block: tier.id } : {};
+
+    for (var s = 0; s < qty; s++) {
+      var slotIdx = allowMixed ? s : 0;
+      var slotState = getSlotState(this._state, this._state.selectedTier, slotIdx);
+      var variant = resolveVariant(this._product, slotState.options);
+      if (!variant) continue;
+
+      if (!allowMixed) {
+        items.push({ id: variant.id, quantity: qty, properties: props });
+        break;
+      }
+
+      var existing = null;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].id === variant.id) { existing = items[i]; break; }
+      }
+      if (existing) {
+        existing.quantity += 1;
+      } else {
+        items.push({ id: variant.id, quantity: 1, properties: props });
+      }
+    }
+
+    // Add free gift items from sub_blocks
+    var self = this;
+    var subs = tier.sub_blocks || [];
+    subs.forEach(function (sub) {
+      if (sub.type !== "free_gift" || !sub.productHandle) return;
+      var giftProduct = GIFT_PRODUCTS[sub.productHandle];
+      if (!giftProduct) return;
+
+      var giftState = self._state.giftSelections && self._state.giftSelections[sub.id];
+      var giftVariant = giftState ? resolveVariant(giftProduct, giftState.options) : (giftProduct.variants[0] || null);
+      if (!giftVariant) return;
+
+      // Each sub-block gets a unique _deal_block: blockId_subBlockId.
+      // This prevents Shopify from merging gift lines from different
+      // sub-blocks into one cart line, so the function can identify
+      // and discount each sub-block independently.
+      var subBlockProps = { _deal_block: (tier.id || "") + "_" + sub.id };
+      items.push({ id: giftVariant.id, quantity: sub.quantity || 1, properties: subBlockProps });
+    });
+
+    return items;
+  };
+
+  /** Render (or re-render) the widget UI */
+  DealEngine.prototype._render = function () {
+    if (this._rendering) return;
+    this._rendering = true;
+    var self = this;
+
+    try {
+      // Update the form's hidden variant ID to match the first slot
+      var firstSlot = getSlotState(this._state, this._state.selectedTier, 0);
+      var primaryVariant = resolveVariant(this._product, firstSlot.options);
+      if (primaryVariant) {
+        this._bridge.setVariantId(primaryVariant.id);
+      }
+
+      var dom = buildWidgetDOM(
+        this._deal,
+        this._product,
+        this._state,
+        function (tierIdx) { self._onTierChange(tierIdx); },
+        function (tierIdx, slotIdx, optIdx, val) { self._onVariantChange(tierIdx, slotIdx, optIdx, val); },
+        function (subId, optIdx, val) { self._onGiftVariantChange(subId, optIdx, val); }
+      );
+
+      this._widgetEl.innerHTML = "";
+      this._widgetEl.appendChild(dom);
+    } finally {
+      this._rendering = false;
+    }
+  };
+
+  DealEngine.prototype._onTierChange = function (tierIdx) {
+    this._state.selectedTier = tierIdx;
+    this._render();
+    this._syncToNativeVariantPicker();
+  };
+
+  DealEngine.prototype._onVariantChange = function (tierIdx, slotIdx, optIdx, value) {
+    if (this._state.slots[tierIdx] && this._state.slots[tierIdx][slotIdx]) {
+      this._state.slots[tierIdx][slotIdx].options[optIdx] = value;
+    }
+    this._render();
+    // If this is the first slot, sync back to the native picker
+    if (slotIdx === 0) this._syncToNativeVariantPicker();
+  };
+
+  DealEngine.prototype._onGiftVariantChange = function (subId, optIdx, value) {
+    if (!this._state.giftSelections) this._state.giftSelections = {};
+    if (!this._state.giftSelections[subId]) this._state.giftSelections[subId] = { options: [] };
+    this._state.giftSelections[subId].options[optIdx] = value;
+    this._render();
+  };
+
+  /**
+   * Push the widget's primary variant selection into the native variant picker.
+   * This keeps the theme's variant picker, price display, and product images
+   * in sync with what the widget shows.
+   */
+  DealEngine.prototype._syncToNativeVariantPicker = function () {
+    var firstSlot = getSlotState(this._state, this._state.selectedTier, 0);
+    var variant = resolveVariant(this._product, firstSlot.options);
+    if (!variant) return;
+
+    this._bridge.setVariantId(variant.id);
+
+    // Try to click/set the native picker to match
+    if (!this._bridge._variantPicker) return;
+    var picker = this._bridge._variantPicker;
+
+    // Strategy 1: Set <select> elements by option name or index
+    var selects = Array.from(picker.querySelectorAll("select"));
+    selects.forEach(function (sel, idx) {
+      var targetVal = firstSlot.options[idx];
+      if (targetVal && sel.value !== targetVal) {
+        sel.value = targetVal;
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    });
+
+    // Strategy 2: Click <input type="radio"> elements
+    var radios = Array.from(picker.querySelectorAll('input[type="radio"]'));
+    firstSlot.options.forEach(function (optVal) {
+      var match = radios.filter(function (r) { return r.value === optVal; })[0];
+      if (match && !match.checked) match.click();
+    });
+  };
+
+  /**
+   * On initialization, read the current variant from the native form
+   * and apply it to the widget state so they start in sync.
+   */
+  DealEngine.prototype._syncFromNativeVariantPicker = function () {
+    var input = this._bridge.variantIdInput();
+    if (!input) return;
+    var currentId = Number(input.value);
+    if (!currentId) return;
+    var variant = findVariantById(this._product, currentId);
+    if (!variant) return;
+
+    var tierIdx = this._state.selectedTier;
+    if (this._state.slots[tierIdx] && this._state.slots[tierIdx][0]) {
+      this._state.slots[tierIdx][0].options = variant.options.slice();
+      this._render();
+    }
+  };
+
+  /* =================================================================
+   * SECTION 12 — WIDGET PLACEMENT (auto-insertion)
+   *
+   * When the merchant did NOT add the <bundle-deals-widget> app block,
+   * this code finds the right spot on the product page and creates one.
+   * It uses PLACEMENT_PAIRS from Section 2.
+   * ================================================================= */
+
+  function autoInsertWidget(productId) {
+    // Already present?
+    if (qs('bundle-deals-widget[product-id="' + productId + '"]')) return;
+
+    var target = findInsertionPoint();
+    if (!target) return;
+
+    var placeholder = el("bundle-deals-widget");
+    placeholder.setAttribute("product-id", productId);
+    target.parentNode.insertBefore(placeholder, target);
+    return placeholder;
+  }
+
+  function findInsertionPoint() {
+    for (var i = 0; i < PLACEMENT_PAIRS.length; i++) {
+      var sel = PLACEMENT_PAIRS[i][0];
+      var candidates = qsa(sel).filter(notInsideCartDrawer);
+      if (candidates.length) return candidates[0];
+    }
+
+    // Ultimate fallback: any form with /cart/add that has a button
+    for (var j = 0; j < CART_FORM_SELECTORS.length; j++) {
+      var forms = qsa(CART_FORM_SELECTORS[j]).filter(notInsideCartDrawer);
+      for (var k = 0; k < forms.length; k++) {
+        var btn = qs("button", forms[k]);
+        if (btn) return forms[k];
+      }
+    }
+    return null;
+  }
+
+  /* =================================================================
+   * SECTION 13 — DEAL MATCHING
+   *
+   * Determines which deal from the catalog applies to a given product.
+   * In production, deals would be filtered server-side via metafield
+   * queries.  Here we check the appliesTo / productIds / excludeProductIds
+   * fields client-side.
+   * ================================================================= */
+
+  function idListContains(list, id) {
+    var s = String(id);
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i]) === s) return true;
+    }
+    return false;
+  }
+
+  function findDealForProduct(productId) {
+    for (var i = 0; i < DEAL_CATALOG.length; i++) {
+      var deal = DEAL_CATALOG[i];
+      // Check scheduling
+      if (deal.startsAt && new Date() < new Date(deal.startsAt)) continue;
+      if (deal.endsAt && new Date() > new Date(deal.endsAt)) continue;
+
+      // Check B2B exclusion
+      if (deal.excludeB2B && _globalConfig && _globalConfig.isB2B) continue;
+
+      // Check location targeting — empty array means all countries
+      if (deal.locations && Array.isArray(deal.locations) && deal.locations.length > 0) {
+        var visitorCountry = _globalConfig && _globalConfig.country;
+        if (visitorCountry && deal.locations.indexOf(visitorCountry) === -1) continue;
+      }
+
+      // Check product targeting
+      if (deal.appliesTo === "all") {
+        if (idListContains(deal.excludeProductIds, productId)) continue;
+        return deal;
+      }
+      if (deal.appliesTo === "specific_products") {
+        if (idListContains(deal.productIds, productId)) return deal;
+      }
+      if (deal.appliesTo === "specific_collections") {
+        var colIds = readProductCollectionIds(productId);
+        var dealColIds = deal.collectionIds || [];
+        for (var c = 0; c < colIds.length; c++) {
+          if (idListContains(dealColIds, colIds[c])) return deal;
+        }
+      }
+    }
+    return null;
+  }
+
+  /* =================================================================
+   * SECTION 14 — BOOTSTRAP
+   *
+   * Entry point.  Waits for DOM ready, reads config, finds widgets,
+   * loads product data, matches deals, and spins up DealEngines.
+   * Also sets up a MutationObserver to catch dynamically-added widgets
+   * (SPA-style navigations, section re-renders, etc.).
+   * ================================================================= */
+
+  function initWidget(widgetEl, productId) {
+    var product = readProductJSON(productId);
+    if (!product) {
+      console.warn("SMART Discounts -  No inline product JSON — trying page fallback for", productId);
+      product = readProductFromPage(productId);
+    }
+    if (!product) {
+      console.error("SMART Discounts -  Could not load product data for", productId, "— widget will be empty");
+      return;
+    }
+
+    var deal = findDealForProduct(productId);
+    if (!deal) {
+      console.warn("SMART Discounts -  No matching deal found for product", productId);
+      return;
+    }
+
+    console.log("SMART Discounts -  Matched deal:", deal.id, "for product", productId);
+
+    try {
+      new DealEngine(widgetEl, deal, product);
+    } catch (err) {
+      console.error("SMART Discounts -  DealEngine failed for product", productId, err);
+    }
+  }
+
+  function readGiftProducts() {
+    try {
+      var giftEl = document.getElementById("bundle-deals-gift-products");
+      if (giftEl) {
+        var rawGifts = JSON.parse(giftEl.textContent);
+        Object.keys(rawGifts).forEach(function (handle) {
+          GIFT_PRODUCTS[handle] = normalizeProductData(rawGifts[handle]);
+        });
+      }
+    } catch (e) {
+      console.warn("SMART Discounts -  Could not parse gift products:", e);
+    }
+  }
+
+  function bootstrap() {
+    readGlobalConfig();
+    readGiftProducts();
+    applyCatalogDefaults();
+
+    // Find all widget placeholders
+    var widgets = qsa("bundle-deals-widget");
+    if (!widgets.length) {
+      // No app block — try to detect product page and auto-insert,
+      // but only if a deal actually applies to this product.
+      var productId = detectProductId();
+      if (productId && findDealForProduct(productId)) {
+        autoInsertWidget(productId);
+        widgets = qsa("bundle-deals-widget");
+      }
+    }
+
+    widgets.forEach(function (widgetEl) {
+      if (widgetEl.getAttribute("data-initialized")) return;
+      widgetEl.setAttribute("data-initialized", "true");
+
+      var productId = Number(widgetEl.getAttribute("product-id"));
+      if (!productId) {
+        console.warn("SMART Discounts -  Widget has no valid product-id attribute", widgetEl);
+        return;
+      }
+      if (_smartProducts[String(productId)]) {
+        widgetEl.style.display = "none";
+        return;
+      }
+
+      console.log("SMART Discounts -  Initializing widget for product", productId);
+      initWidget(widgetEl, productId);
+    });
+
+    // Watch for new widgets added to the DOM (SPA navigation, section reloads)
+    observeNewWidgets();
+  }
+
+  /**
+   * Try to detect the current product ID from the page context.
+   * Shopify makes product data available in several standard ways.
+   */
+  function detectProductId() {
+    // Method 1: Shopify's global meta tag
+    var meta = qs('meta[property="og:type"][content="product"]');
+    if (!meta) return null;
+
+    // Method 2: ShopifyAnalytics
+    if (window.ShopifyAnalytics && window.ShopifyAnalytics.meta && window.ShopifyAnalytics.meta.product) {
+      return window.ShopifyAnalytics.meta.product.id;
+    }
+
+    // Method 3: URL pattern /products/handle → fetch product ID from script tags
+    if (window.location.pathname.indexOf("/products/") !== -1) {
+      var scripts = qsa('script[type="application/json"]');
+      for (var i = 0; i < scripts.length; i++) {
+        try {
+          var data = JSON.parse(scripts[i].textContent);
+          if (data && data.id && data.variants) return data.id;
+        } catch (_) {}
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Fallback: try to read product data from the page's existing
+   * JSON (many themes include a <script type="application/json"> with
+   * full product data, or Shopify provides it in the global scope).
+   */
+  function readProductFromPage(productId) {
+    // Check <script type="application/json"> tags with product data
+    var scripts = qsa('script[type="application/json"]');
+    for (var i = 0; i < scripts.length; i++) {
+      try {
+        var data = JSON.parse(scripts[i].textContent);
+        if (data && data.id === productId && data.variants) {
+          return normalizeProductData(data);
+        }
+        // Some themes nest product data inside a wrapper
+        if (data && data.product && data.product.id === productId && data.product.variants) {
+          return normalizeProductData(data.product);
+        }
+      } catch (_) {}
+    }
+
+    // Check <script type="application/ld+json"> (structured data)
+    var ldScripts = qsa('script[type="application/ld+json"]');
+    for (var j = 0; j < ldScripts.length; j++) {
+      try {
+        var ld = JSON.parse(ldScripts[j].textContent);
+        if (ld && ld["@type"] === "Product" && ld.productID == productId) {
+          return normalizeProductData(ld);
+        }
+      } catch (_) {}
+    }
+
+    // Check common global JS variables set by themes
+    try {
+      if (window.product && window.product.id === productId) return normalizeProductData(window.product);
+      if (window.meta && window.meta.product && window.meta.product.id === productId) return normalizeProductData(window.meta.product);
+      if (window.ShopifyAnalytics && window.ShopifyAnalytics.meta && window.ShopifyAnalytics.meta.product) {
+        var sp = window.ShopifyAnalytics.meta.product;
+        if (sp.id === productId && sp.variants) return normalizeProductData(sp);
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  /**
+   * Normalize product data from various formats into our expected shape.
+   * Different sources (Liquid, Storefront API, theme JSON) use different
+   * key naming conventions.
+   */
+  function normalizeProductData(raw) {
+    if (!raw || !raw.variants) return null;
+
+    // Resolve featured image — can be a string URL, an object with .src, or null
+    var featImg = raw.featuredImage || raw.featured_image || null;
+    if (featImg && typeof featImg === "object") featImg = featImg.src || null;
+
+    // Build options with values. The /products/{handle}.js response has
+    // options as string array ["Size","Color"] and puts values inside each
+    // variant as option1/option2/option3. We need the full {name, values} shape.
+    var optionNames = [];
+    var optionValuesMap = {};
+
+    if (raw.options && raw.options.length) {
+      if (typeof raw.options[0] === "string") {
+        optionNames = raw.options;
+      } else {
+        optionNames = raw.options.map(function (o) { return o.name; });
+        raw.options.forEach(function (o) {
+          if (o.values && o.values.length) optionValuesMap[o.name] = o.values;
+        });
+      }
+    }
+
+    // Collect all option values from variants if not already known
+    raw.variants.forEach(function (v) {
+      var vOpts = v.options || [v.option1, v.option2, v.option3].filter(function (x) { return x != null; });
+      vOpts.forEach(function (val, idx) {
+        var name = optionNames[idx] || ("Option " + (idx + 1));
+        if (!optionValuesMap[name]) optionValuesMap[name] = [];
+        if (optionValuesMap[name].indexOf(val) === -1) optionValuesMap[name].push(val);
+      });
+    });
+
+    var options = optionNames.map(function (name, idx) {
+      return { name: name, position: idx + 1, values: optionValuesMap[name] || [] };
+    });
+
+    var variants = raw.variants.map(function (v) {
+      var vImg = v.image || (v.featured_image && typeof v.featured_image === "object" ? v.featured_image.src : v.featured_image) || null;
+      var rawCompare = v.compareAtPrice || v.compare_at_price;
+      return {
+        id: v.id,
+        title: v.title,
+        price: toCents(v.price),
+        compareAtPrice: rawCompare ? toCents(rawCompare) : null,
+        available: v.available !== false,
+        options: v.options || [v.option1, v.option2, v.option3].filter(function (x) { return x != null; }),
+        image: vImg,
+        inventoryQuantity: v.inventoryQuantity || v.inventory_quantity || 0,
+        inventoryPolicy: v.inventoryPolicy || v.inventory_policy || "deny",
+      };
+    });
+
+    return {
+      id: raw.id,
+      title: raw.title,
+      handle: raw.handle,
+      available: raw.available !== false,
+      url: raw.url || "/products/" + raw.handle,
+      featuredImage: featImg,
+      options: options,
+      variants: variants,
+      selectedVariantId: raw.selectedVariantId || raw.selected_variant_id ||
+        (variants[0] && variants[0].id),
+      hasOnlyDefaultVariant: !!(raw["has_only_default_variant"] || raw.hasOnlyDefaultVariant ||
+        (options.length <= 1 && variants.length <= 1)),
+    };
+  }
+
+  /** MutationObserver to catch widgets added after initial page load */
+  var _widgetObserver = null;
+
+  function observeNewWidgets() {
+    if (_widgetObserver) return;
+    _widgetObserver = new MutationObserver(function (mutations) {
+      var found = false;
+      mutations.forEach(function (m) {
+        Array.from(m.addedNodes).forEach(function (node) {
+          if (!(node instanceof HTMLElement)) return;
+          if (node.tagName === "BUNDLE-DEALS-WIDGET" && !node.getAttribute("data-initialized")) found = true;
+          if (node.querySelector && node.querySelector("bundle-deals-widget:not([data-initialized])")) found = true;
+        });
+      });
+      if (found) bootstrap();
+    });
+    _widgetObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  /** Patch history methods to detect SPA-style navigations */
+  function watchNavigation() {
+    var origPush = history.pushState;
+    var origReplace = history.replaceState;
+    history.pushState = function () {
+      var result = origPush.apply(this, arguments);
+      window.dispatchEvent(new Event("bundle-deals:navigation"));
+      return result;
+    };
+    history.replaceState = function () {
+      var result = origReplace.apply(this, arguments);
+      window.dispatchEvent(new Event("bundle-deals:navigation"));
+      return result;
+    };
+    window.addEventListener("popstate", function () {
+      window.dispatchEvent(new Event("bundle-deals:navigation"));
+    });
+    window.addEventListener("bundle-deals:navigation", function () {
+      setTimeout(bootstrap, 300);
+    });
+  }
+
+  // The new bundle widget covers this product: hide ours and stop intercepting its add to cart.
+  document.addEventListener("smart-widget:active", function (event) {
+    var id = event && event.detail && event.detail.productId;
+    if (id == null || id === "") return;
+    _smartProducts[String(id)] = true;
+    CartProxy.unregister(Number(id));
+    qsa('bundle-deals-widget[product-id="' + String(id).replace(/[^0-9]/g, "") + '"]').forEach(function (el) {
+      el.style.display = "none";
+    });
+  });
+
+  // ---- KICK IT OFF ----
+  function init() {
+    watchNavigation();
+    bootstrap();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
